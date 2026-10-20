@@ -651,7 +651,7 @@ impl App {
     // ------------------------------------------------------------------ 面板
 
     fn top_bar(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        egui::Panel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("局域网传输");
                 ui.separator();
@@ -680,7 +680,7 @@ impl App {
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some((name, done, total)) = &self.recv_progress {
                     ui.label(format!("接收（{name}）"));
@@ -709,9 +709,9 @@ impl App {
     }
 
     fn side_panel(&mut self, ctx: &egui::Context, friends: &[Friend], acts: &mut Vec<Act>) {
-        egui::SidePanel::left("friends")
-            .default_width(230.0)
-            .min_width(180.0)
+        egui::Panel::left("friends")
+            .default_size(230.0)
+            .min_size(180.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 if ui.button("+ 添加好友").clicked() {
@@ -740,11 +740,11 @@ impl App {
                             resp.context_menu(|ui| {
                                 if ui.button("清空聊天记录").clicked() {
                                     acts.push(Act::AskClear(f.id));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("删除好友").clicked() {
                                     acts.push(Act::Remove(f.id));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         });
@@ -800,8 +800,8 @@ impl App {
         const MAX_H: f32 = 450.0;
         //const OVERHEAD: f32 = 105.0; // 分隔条 + 按钮行 + 发送行 + 边距，用于算文本区高度
 
-        egui::TopBottomPanel::bottom("input")
-            .exact_height(self.input_height)
+        egui::Panel::bottom("input")
+            .exact_size(self.input_height)
             .show(ctx, |ui| {
                 // —— 顶部拖拽条：向上拖变高，向下拖变矮
                 let (hrect, hresp) = ui.allocate_exact_size(
@@ -968,10 +968,10 @@ impl App {
                                 });
                                 ui.horizontal(|ui| {
                                     ui.add_space(off(bubble_w));
-                                    let inner = egui::Frame::none()
+                                    let inner = egui::Frame::NONE
                                         .fill(fill)
-                                        .rounding(8.0)
-                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                        .corner_radius(8.0)
+                                        .inner_margin(egui::Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
                                             ui.set_width(text_w);
                                             ui.add(
@@ -989,7 +989,7 @@ impl App {
                                     resp.context_menu(|ui| {
                                         if ui.button("删除这条").clicked() {
                                             del = Some(i);
-                                            ui.close_menu();
+                                            ui.close();
                                         }
                                     });
                                 });
@@ -1370,7 +1370,7 @@ impl App {
 // ------------------------------------------------------------------ eframe 入口
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         winctl::cache_hwnd(frame);
         if !self.first_frame_done {
             self.first_frame_done = true;
@@ -1404,6 +1404,11 @@ impl eframe::App for App {
             self.on_event(ev);
         }
         self.handle_drops(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let _ = frame; // 暂时不需要
+        let ctx = ui.ctx();
 
         let friends = self.node.friends.list();
         let mut acts: Vec<Act> = Vec::new();

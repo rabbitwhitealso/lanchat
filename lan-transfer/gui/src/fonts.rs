@@ -158,7 +158,7 @@ pub fn setup(ctx: &egui::Context) -> bool {
     let mut fonts = egui::FontDefinitions::default();
     let mut data = egui::FontData::from_owned(bytes);
     data.index = index;
-    fonts.font_data.insert("cjk".to_owned(), data.into());
+    fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(data));
     for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(fam).or_default().push("cjk".to_owned());
     }

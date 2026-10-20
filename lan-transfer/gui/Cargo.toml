@@ -10,17 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 lan-core = { path = "../core" }
-eframe = "0.29"
-# eframe = {
-#    version = "0.29",
-#    features = ["glow", "wgpu"]
-# }
+eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 raw-window-handle = "0.6"
 
 [features]
 # 把 gui/assets/font.ttf 编进可执行文件（真正零外部字体依赖）。
 # 需要你自己放一个中文字体文件（.ttf/.otf/.ttc 均可，改名为 font.ttf）。
 embed-font = []
-
-[patch.crates-io]
-egui-winit = { path = "patches/egui-winit" }
