@@ -1,0 +1,10 @@
+# Windows：静态链接 C 运行库，目标机器不需要安装 "Visual C++ 运行库"
+# （缺运行库会导致程序一闪而过或根本没反应，是 "某台电脑没反应" 的常见原因之一）
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

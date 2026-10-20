@@ -1,0 +1,7 @@
+{
+    "corePath": "lanchat",
+    "args": ["--tray-mode"],
+    "workDir": "",
+    "autoStartCore": true,
+    "autoRestart": true
+}

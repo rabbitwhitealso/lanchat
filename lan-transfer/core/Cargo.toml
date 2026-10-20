@@ -1,0 +1,9 @@
+[package]
+name = "lan-core"
+version = "0.2.0"
+edition = "2021"
+
+# 唯一的第三方依赖：纯 Rust 的 Ed25519 签名库（静态链接，目标机器无需安装任何东西，
+# 交叉编译到麒麟 ARM / Windows ARM 也不需要 C 编译器）
+[dependencies]
+ed25519-dalek = "2"

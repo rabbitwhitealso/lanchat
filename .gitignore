@@ -1,0 +1,54 @@
+# ===== Rust =====
+target/
+Cargo.lock
+
+# ===== C++ / Qt / CMake =====
+tray/build/
+*.user
+*.autosave
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+x64/
+Debug/
+Release/
+
+# Qt Creator
+*.pro.user
+*.pro.user.*
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 编译产物 =====
+*.exe
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.bin
+*.o
+*.so
+*.dylib
+
+# ===== 系统 =====
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Desktop.ini
+
+# ===== Trae / 临时 =====
+.trae/
+*.log
+*.tmp
+*.lock
+
+# ===== 配置（本地私有）=====
+tray_config.json
