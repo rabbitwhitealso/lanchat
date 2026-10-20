@@ -17,3 +17,10 @@ raw-window-handle = "0.6"
 # 把 gui/assets/font.ttf 编进可执行文件（真正零外部字体依赖）。
 # 需要你自己放一个中文字体文件（.ttf/.otf/.ttc 均可，改名为 font.ttf）。
 embed-font = []
+
+# Linux IME 修复：麒麟 UKUI/Wayland 上第二次 composition 不工作
+# - 让 winit::Ime::Enabled 在 Linux 上也发 egui::ImeEvent::Enabled
+# - 让 winit::Ime::Preedit(_, None) 在所有平台上发 Preedit("")
+# 上游 egui-winit 0.34.3 的 cfg 守卫过于严格
+[patch.crates-io]
+egui-winit = { path = "patches/egui-winit" }

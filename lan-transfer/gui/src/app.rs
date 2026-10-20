@@ -757,39 +757,6 @@ impl App {
                 });
             });
     }
-    /* 
-    fn input_panel(&mut self, ctx: &egui::Context, friends: &[Friend], acts: &mut Vec<Act>) {
-        if self.selected_friend(friends).is_none() {
-            return;
-        }
-        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("发送文件/文件夹").clicked() {
-                    acts.push(Act::OpenPicker(PickPurpose::SendPath));
-                }
-                ui.weak("也可以把文件或文件夹直接拖进窗口");
-            });
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 80.0).max(100.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.input)
-                        .desired_width(w)
-                        .hint_text("输入文字，回车发送"),
-                );
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let click = ui.button("发送").clicked();
-                if (enter || click) && !self.input.trim().is_empty() {
-                    acts.push(Act::SendText);
-                    if enter {
-                        resp.request_focus();
-                    }
-                }
-            });
-            ui.add_space(4.0);
-        });
-    }
-    */
     
     fn input_panel(&mut self, ctx: &egui::Context, friends: &[Friend], acts: &mut Vec<Act>) {
         if self.selected_friend(friends).is_none() {
@@ -830,23 +797,29 @@ impl App {
                     ui.weak("也可以把文件或文件夹直接拖进窗口");
                 });
 
-                // —— 跟踪输入法组词状态：组词期间按回车是"确认候选词"，不是发送
+                // —— 跟踪输入法组词状态
+                let has_focus_now = ui.memory(|m| m.has_focus(input_id)); // 闭包外取
+                let ime_events: Vec<egui::ImeEvent> = ui.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Ime(ev) => Some(ev.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                });
+
                 let mut ime_event_this_frame = false;
                 let mut composing = self.ime_composing;
-                ui.input(|i| {
-                    for e in &i.events {
-                        if let egui::Event::Ime(ev) = e {
-                            ime_event_this_frame = true;
-                            match ev {
-                                egui::ImeEvent::Preedit(s) => composing = !s.is_empty(),
-                                egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
-                                    composing = false
-                                }
-                                egui::ImeEvent::Enabled => {}
-                            }
-                        }
+                for ev in &ime_events {
+                    logging::info(format!("IME事件: {ev:?}  focus={has_focus_now}"));
+                    ime_event_this_frame = true;
+                    match ev {
+                        egui::ImeEvent::Preedit(s) => composing = !s.is_empty(),
+                        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => composing = false,
+                        egui::ImeEvent::Enabled => {}
                     }
-                });
+                }
                 self.ime_composing = composing;
 
                 // —— 回车发送，Shift+回车换行。必须在 TextEdit 之前处理
