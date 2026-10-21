@@ -1,10 +1,9 @@
 //! 后台线程 → 界面线程 的事件，以及 lan-core 的 Handler 实现
 //!
-//! 重要：窗口隐藏时 egui 可能不刷新，所以"收到消息后落盘、通知托盘、必要时把窗口
-//! 弹出来"都在这里（网络线程里）直接做完；发给界面的事件只是为了让界面更新显示。
+//! 重要：这些"收到消息后落盘、通知托盘、必要时把窗口弹出来"都在这里（网络线程里）直接做完，
+//! 不依赖界面线程；发给界面的事件只是为了让界面更新显示。
 
 use crate::{tray_ipc, winctl};
-use eframe::egui;
 use lan_core::history::{History, Kind, Record};
 use lan_core::timeutil::now_ms;
 use lan_core::wire::DeviceId;
@@ -15,6 +14,9 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool};
+
+/// 从任意线程叫醒界面线程（界面线程收到后会取走队列里的事件）
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// 界面等待"人"点击的最长时间，要比 core 里客户端的 120 秒略短
 const DECISION_TIMEOUT: Duration = Duration::from_secs(110);
@@ -60,7 +62,7 @@ pub enum Event {
 
 pub struct GuiHandler {
     tx: Sender<Event>,
-    ctx: egui::Context,
+    wake: Waker,
     tray: bool,
     history: Arc<History>,
     last_progress: Mutex<Instant>,
@@ -69,10 +71,10 @@ pub struct GuiHandler {
 }
 
 impl GuiHandler {
-    pub fn new(tx: Sender<Event>, ctx: egui::Context, tray: bool, history: Arc<History>) -> GuiHandler {
+    pub fn new(tx: Sender<Event>, wake: Waker, tray: bool, history: Arc<History>) -> GuiHandler {
         GuiHandler {
             tx,
-            ctx,
+            wake,
             tray,
             history,
             last_progress: Mutex::new(Instant::now()),
@@ -83,7 +85,7 @@ impl GuiHandler {
 
     fn emit(&self, ev: Event) {
         let _ = self.tx.send(ev);
-        self.ctx.request_repaint();
+        (self.wake)();
     }
 
     /// 窗口不在前台且没开免打扰时，才通知托盘弹气泡
@@ -101,7 +103,7 @@ impl GuiHandler {
     /// 需要人来点的请求（好友请求、文件）：托盘模式下把窗口弹出来，否则会一直等到超时
     fn raise_window(&self) {
         if self.tray && !tray_ipc::DND.load(Ordering::Relaxed) {
-            winctl::show(&self.ctx);
+            winctl::show();
         }
     }
 }

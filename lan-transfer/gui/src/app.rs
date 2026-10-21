@@ -1,30 +1,82 @@
-//! 界面主体（v2：UID 好友、局域网发现、聊天记录与时间、托盘模式）
+//! 界面主体（Slint 版；v2 功能：UID 好友、局域网发现、聊天记录与时间、托盘模式）
+//!
+//! 分工：
+//! - ui/main.slint 只描述界面，通过 in 属性取数据、通过 callback 上报点击；
+//! - 这里的 `App` 持有全部状态（好友、聊天记录、未读、对话框状态…），运行在界面线程，
+//!   用 `Rc<RefCell<App>>` 在各个 callback 之间共享；
+//! - 网络线程（events.rs 的 GuiHandler、后台任务）通过 mpsc 通道发 `Event`，再用 `Waker`
+//!   叫醒界面线程，界面线程在 `drain()` 里统一取走并刷新界面。
+//!
+//! 注意：不要在持有 `borrow_mut()` 的同时去触发别的 Slint callback（Rust 里只调 set_xxx 即可）。
 
-use crate::events::{Event, GuiHandler};
-use crate::picker::{PickOutcome, PickPurpose, Picker};
+use crate::events::{Event, GuiHandler, Waker};
+use crate::picker::{PickPurpose, Picker};
 use crate::settings::{home_dir, Settings};
-use crate::{fonts, logging, net_util, tray_ipc, winctl};
-use eframe::egui::{self, Color32};
+use crate::{logging, net_util, tray_ipc, FoundRow, FriendRow, MainWindow, MsgRow, PickRow};
 use lan_core::discovery::DISCOVERY_PORT;
 use lan_core::history::{History, Kind, Record};
 use lan_core::store::{id_to_hex, short_id, DEFAULT_PORT};
 use lan_core::timeutil::{format_ts, now_ms};
 use lan_core::wire::DeviceId;
-use lan_core::{Discovery, Error, Found, Friend, FriendStore, Identity, Node, OfferSummary, PeerInfo};
+use lan_core::{Discovery, Error, Friend, FriendStore, Identity, Node, OfferSummary, PeerInfo};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const RED: Color32 = Color32::from_rgb(200, 60, 60);
-const GREEN: Color32 = Color32::from_rgb(60, 170, 90);
-const BLUE: Color32 = Color32::from_rgb(70, 130, 220);
 const MAX_LOG_LINES: usize = 2000;
+
+pub type Shared = Rc<RefCell<App>>;
+
+thread_local! {
+    /// 界面线程里的全局 App，供"后台线程叫醒界面"和"定时器"回调使用
+    static APP: RefCell<Option<Shared>> = RefCell::new(None);
+    /// 拖入的文件：winit 每个文件发一个事件，攒一小会儿再统一弹确认框
+    static DROPPED: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+    static DROP_TIMER: slint::Timer = slint::Timer::default();
+}
+
+fn with_app(f: impl FnOnce(&mut App)) {
+    let app = APP.with(|a| a.borrow().clone());
+    if let Some(app) = app {
+        if let Ok(mut a) = app.try_borrow_mut() {
+            f(&mut a);
+        }
+    }
+}
+
+/// 从任意线程叫醒界面线程
+fn make_waker() -> Waker {
+    Arc::new(|| {
+        let _ = slint::invoke_from_event_loop(|| with_app(|a| a.drain()));
+    })
+}
+
+/// winit 的拖入文件事件（界面线程）。多个文件会连续到达，延迟 150ms 合并成一次确认
+pub fn handle_dropped_file(p: PathBuf) {
+    DROPPED.with(|d| d.borrow_mut().push(p));
+    DROP_TIMER.with(|t| {
+        t.start(slint::TimerMode::SingleShot, Duration::from_millis(150), || {
+            let paths = DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+            if !paths.is_empty() {
+                with_app(|a| a.set_drop_confirm(paths));
+            }
+        });
+    });
+}
+
+/// 每秒一次：取走事件、刷新好友名字/地址、发现列表（对应旧版 request_repaint_after(1s)）
+pub fn tick() {
+    with_app(|a| a.drain());
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Who {
@@ -62,57 +114,36 @@ struct PendingOffer {
     reply: Sender<Option<PathBuf>>,
 }
 
-#[derive(Default)]
-struct AddDialog {
-    open: bool,
-    addr: String,
-    busy: bool,
-    error: String,
-}
-
-/// 界面闭包里只"登记"动作，闭包结束后再统一执行，避免借用冲突
-enum Act {
-    Select(DeviceId),
-    OpenAdd(String),
-    Remove(DeviceId),
-    SendText,
-    OpenPicker(PickPurpose),
-    OpenSettings,
-    AskClear(DeviceId),
-}
-
 pub struct App {
+    ui: slint::Weak<MainWindow>,
     node: Arc<Node>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
-    ctx: egui::Context,
+    wake: Waker,
     settings: Settings,
     history: Arc<History>,
     disc: Option<Arc<Discovery>>,
     disc_error: Option<String>,
-    tray: bool,
-    show_at_start: bool,
-    first_frame_done: bool,
 
     selected: Option<DeviceId>,
+    sel_name: String,
+    /// 界面上好友列表的当前顺序（回调里的下标对应这里）
+    friends: Vec<Friend>,
     logs: HashMap<DeviceId, Vec<Line>>,
     loaded: HashSet<DeviceId>,
     unread: HashMap<DeviceId, u32>,
     online: HashMap<DeviceId, bool>,
-    input: String,
 
     pending_requests: Vec<(PeerInfo, Sender<bool>)>,
     pending_offers: Vec<PendingOffer>,
     recv_progress: Option<(String, u64, u64)>,
     send_progress: Option<(String, u64, u64)>,
 
-    add: AddDialog,
+    add_open: bool,
+    add_busy: bool,
+    add_error: String,
+    found_addrs: Vec<SocketAddr>,
     settings_open: bool,
-    name_edit: String,
-    port_edit: String,
-    save_dir_edit: String,
-    disc_edit: bool,
-    dnd_edit: bool,
     settings_msg: Option<String>,
     picker: Option<Picker>,
     last_dir: PathBuf,
@@ -123,8 +154,12 @@ pub struct App {
     status: String,
     fatal: Option<String>,
 
-    ime_composing: bool,
-    input_height: f32,
+    friends_model: Rc<VecModel<FriendRow>>,
+    msgs_model: Rc<VecModel<MsgRow>>,
+    found_model: Rc<VecModel<FoundRow>>,
+    drop_model: Rc<VecModel<SharedString>>,
+    roots_model: Rc<VecModel<SharedString>>,
+    pick_model: Rc<VecModel<PickRow>>,
 }
 
 // ------------------------------------------------------------------ 小工具
@@ -150,11 +185,6 @@ fn frac(done: u64, total: u64) -> f32 {
     } else {
         (done as f64 / total as f64) as f32
     }
-}
-
-fn dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
 fn parse_addr(s: &str) -> Option<SocketAddr> {
@@ -186,28 +216,17 @@ fn file_label(p: &std::path::Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+fn ss(s: impl Into<String>) -> SharedString {
+    SharedString::from(s.into())
+}
+
 // ------------------------------------------------------------------ 初始化
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, tray_mode: bool, show_at_start: bool) -> App {
-        let ctx = cc.egui_ctx.clone();
-
-        // Glow/OpenGL 信息
-        if let Some(gl) = cc.gl.as_ref() {
-            use eframe::glow::HasContext as _;
-
-            unsafe {
-                logging::info(format!(
-                    "OpenGL 版本={}  渲染器={}  厂商={}",
-                    gl.get_parameter_string(eframe::glow::VERSION),
-                    gl.get_parameter_string(eframe::glow::RENDERER),
-                    gl.get_parameter_string(eframe::glow::VENDOR)
-                ));
-            }
-        }
-
-        let has_font = fonts::setup(&ctx);
-        logging::info(format!("中文字体: {}", if has_font { "已加载" } else { "未找到" }));
+    /// 创建 App：读身份/好友/设置，启动监听、局域网发现、在线探测等后台线程，
+    /// 并把各个 Slint callback 接上。返回的 `Shared` 要一直活到程序结束。
+    pub fn start(ui: &MainWindow, tray_mode: bool) -> Shared {
+        let wake = make_waker();
         let (tx, rx) = mpsc::channel::<Event>();
 
         let mut startup: Vec<String> = Vec::new();
@@ -240,14 +259,19 @@ impl App {
         crate::events::set_save_dir(&settings.save_dir);
 
         let history = Arc::new(History::open());
-        let handler = Arc::new(GuiHandler::new(tx.clone(), ctx.clone(), tray_mode, Arc::clone(&history)));
+        let handler = Arc::new(GuiHandler::new(
+            tx.clone(),
+            wake.clone(),
+            tray_mode,
+            Arc::clone(&history),
+        ));
         let node = Node::new(identity, Arc::new(friends), handler);
 
         // 监听线程
         {
             let n = Arc::clone(&node);
             let tx2 = tx.clone();
-            let ctx2 = ctx.clone();
+            let wake2 = wake.clone();
             thread::spawn(move || {
                 logging::info(format!("开始监听 TCP 端口 {}", n.identity.port));
                 if let Err(e) = n.serve() {
@@ -257,7 +281,7 @@ impl App {
                     );
                     logging::error(&msg);
                     let _ = tx2.send(Event::ServeFailed(msg));
-                    ctx2.request_repaint();
+                    wake2();
                 }
             });
         }
@@ -278,71 +302,81 @@ impl App {
         // 本机 IP（要调用系统命令，放到后台）
         {
             let tx2 = tx.clone();
-            let ctx2 = ctx.clone();
+            let wake2 = wake.clone();
             thread::spawn(move || {
                 let ips = net_util::local_ips();
                 logging::info(format!("本机 IP: {}", ips.join(", ")));
                 let _ = tx2.send(Event::LocalIps(ips));
-                ctx2.request_repaint();
+                wake2();
             });
         }
-        net_util::spawn_presence(Arc::clone(&node), tx.clone(), ctx.clone());
+        net_util::spawn_presence(Arc::clone(&node), tx.clone(), wake.clone());
 
         if tray_mode {
-            tray_ipc::spawn_reader(ctx.clone());
+            tray_ipc::spawn_reader();
             logging::info("托盘模式：开始读取托盘命令（stdin），状态事件写到 stdout");
         }
         tray_ipc::publish_status();
 
-        let mut status = startup.join("；");
-        if !has_font {
-            if !status.is_empty() {
-                status.push_str("；");
-            }
-            status.push_str("未找到中文字体，中文会显示成方块。请设置环境变量 LAN_FONT 指向字体文件，或用 embed-font 重新编译");
-        }
-
-        logging::info("界面初始化完成");
-        App {
+        let app = App {
+            ui: ui.as_weak(),
             node,
             tx,
             rx,
-            ctx,
-            save_dir_edit: settings.save_dir.display().to_string(),
-            disc_edit: settings.discoverable,
-            dnd_edit: settings.dnd,
+            wake,
             settings,
             history,
             disc,
             disc_error,
-            tray: tray_mode,
-            show_at_start,
-            first_frame_done: false,
             selected: None,
+            sel_name: String::new(),
+            friends: Vec::new(),
             logs: HashMap::new(),
             loaded: HashSet::new(),
             unread: HashMap::new(),
             online: HashMap::new(),
-            input: String::new(),
             pending_requests: Vec::new(),
             pending_offers: Vec::new(),
             recv_progress: None,
             send_progress: None,
-            add: AddDialog::default(),
+            add_open: false,
+            add_busy: false,
+            add_error: String::new(),
+            found_addrs: Vec::new(),
             settings_open: false,
-            name_edit: String::new(),
-            port_edit: String::new(),
             settings_msg: None,
             picker: None,
             last_dir: home_dir(),
             drop_confirm: None,
             confirm_clear: None,
             local_ips: Vec::new(),
-            status,
+            status: startup.join("；"),
             fatal: None,
-            ime_composing: false,
-            input_height: 150.0,
-        }
+            friends_model: Rc::new(VecModel::default()),
+            msgs_model: Rc::new(VecModel::default()),
+            found_model: Rc::new(VecModel::default()),
+            drop_model: Rc::new(VecModel::default()),
+            roots_model: Rc::new(VecModel::default()),
+            pick_model: Rc::new(VecModel::default()),
+        };
+
+        ui.set_friends(ModelRc::from(app.friends_model.clone()));
+        ui.set_messages(ModelRc::from(app.msgs_model.clone()));
+        ui.set_found(ModelRc::from(app.found_model.clone()));
+        ui.set_drop_lines(ModelRc::from(app.drop_model.clone()));
+        ui.set_picker_roots(ModelRc::from(app.roots_model.clone()));
+        ui.set_picker_rows(ModelRc::from(app.pick_model.clone()));
+
+        let shared: Shared = Rc::new(RefCell::new(app));
+        APP.with(|a| *a.borrow_mut() = Some(shared.clone()));
+        wire(&shared, ui);
+        shared.borrow_mut().drain();
+        logging::info("界面初始化完成");
+        shared
+    }
+
+    fn ui(&self) -> MainWindow {
+        self.ui.upgrade().expect("主窗口已销毁")
     }
 
     // ------------------------------------------------------------------ 聊天记录
@@ -361,15 +395,50 @@ impl App {
         self.logs.insert(id, lines);
     }
 
+    fn make_row(&self, who: Who, text: &str, ts: u64) -> MsgRow {
+        let when = format_ts(ts, now_ms());
+        match who {
+            Who::Sys => MsgRow { kind: 2, head: ss(when), text: ss(text) },
+            Who::Me => MsgRow { kind: 0, head: ss(format!("我  {when}")), text: ss(text) },
+            Who::Peer => MsgRow {
+                kind: 1,
+                head: ss(format!("{}  {}", self.sel_name, when)),
+                text: ss(text),
+            },
+        }
+    }
+
+    /// 用当前选中好友的聊天记录重建消息列表（选中/清空/改名/截断时才用，平时是增量追加）
+    fn rebuild_messages(&mut self) {
+        let rows: Vec<MsgRow> = match self.selected.and_then(|id| self.logs.get(&id)) {
+            Some(lines) => lines.iter().map(|l| self.make_row(l.who, &l.text, l.ts)).collect(),
+            None => Vec::new(),
+        };
+        self.msgs_model.set_vec(rows);
+        self.ui().set_follow(true);
+    }
+
     /// 只放进内存（记录已经由网络线程写过盘的消息）。重复的（同时间同内容）会被忽略
     fn push_mem(&mut self, id: DeviceId, who: Who, text: String, ts: u64) {
-        let v = self.logs.entry(id).or_default();
-        if v.last().map(|l| l.ts == ts && l.who == who && l.text == text).unwrap_or(false) {
-            return;
+        let mut truncated = false;
+        {
+            let v = self.logs.entry(id).or_default();
+            if v.last().map(|l| l.ts == ts && l.who == who && l.text == text).unwrap_or(false) {
+                return;
+            }
+            v.push(Line { who, text: text.clone(), ts });
+            if v.len() > MAX_LOG_LINES {
+                v.drain(0..500);
+                truncated = true;
+            }
         }
-        v.push(Line { who, text, ts });
-        if v.len() > MAX_LOG_LINES {
-            v.drain(0..500);
+        if self.selected == Some(id) {
+            if truncated {
+                self.rebuild_messages();
+            } else {
+                let row = self.make_row(who, &text, ts);
+                self.msgs_model.push(row);
+            }
         }
     }
 
@@ -395,6 +464,9 @@ impl App {
             if let Err(e) = self.history.delete(&id, &rec) {
                 logging::warn(format!("删除聊天记录失败: {e}"));
             }
+            if self.selected == Some(id) && idx < self.msgs_model.row_count() {
+                self.msgs_model.remove(idx);
+            }
         }
     }
 
@@ -404,19 +476,270 @@ impl App {
         }
         self.loaded.insert(id);
         self.logs.insert(id, Vec::new());
+        if self.selected == Some(id) {
+            self.rebuild_messages();
+        }
     }
 
     // ------------------------------------------------------------------ 状态辅助
 
-    fn selected_friend(&self, friends: &[Friend]) -> Option<Friend> {
+    fn selected_friend(&self) -> Option<Friend> {
         let id = self.selected?;
-        friends.iter().find(|f| f.id == id).cloned()
+        self.friends.iter().find(|f| f.id == id).cloned()
+    }
+
+    fn friend_name(&self, id: &DeviceId) -> String {
+        self.friends
+            .iter()
+            .find(|f| &f.id == id)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| short_id(id))
     }
 
     fn mark_unread(&mut self, id: DeviceId) {
         if self.selected != Some(id) {
             *self.unread.entry(id).or_insert(0) += 1;
         }
+    }
+
+    fn set_selected(&mut self, id: Option<DeviceId>) {
+        self.selected = id;
+        if let Some(id) = id {
+            self.unread.remove(&id);
+            self.ensure_loaded(id);
+        }
+        self.sync_friends();
+        self.rebuild_messages();
+    }
+
+    // ------------------------------------------------------------------ 把状态同步到界面
+
+    /// 刷新好友列表和聊天标题。返回 true 表示"当前聊天对象变了/名字变了"，消息列表需要重建
+    fn sync_friends(&mut self) -> bool {
+        let list = self.node.friends.list();
+        let mut need_rebuild = false;
+
+        if let Some(id) = self.selected {
+            if !list.iter().any(|f| f.id == id) {
+                self.selected = None;
+                need_rebuild = true;
+            }
+        }
+
+        let rows: Vec<FriendRow> = list
+            .iter()
+            .map(|f| FriendRow {
+                id: ss(id_to_hex(&f.id)),
+                name: ss(f.name.clone()),
+                addr: ss(format!("{}:{}", f.ip, f.port)),
+                online: self.online.get(&f.id).copied().unwrap_or(false),
+                unread: self.unread.get(&f.id).copied().unwrap_or(0) as i32,
+                selected: self.selected == Some(f.id),
+            })
+            .collect();
+        if self.friends_model.row_count() != rows.len() {
+            self.friends_model.set_vec(rows);
+        } else {
+            for (i, r) in rows.into_iter().enumerate() {
+                if self.friends_model.row_data(i).as_ref() != Some(&r) {
+                    self.friends_model.set_row_data(i, r);
+                }
+            }
+        }
+
+        let sel = self.selected.and_then(|id| list.iter().find(|f| f.id == id).cloned());
+        self.friends = list;
+
+        let ui = self.ui();
+        match &sel {
+            Some(f) => {
+                ui.set_has_sel(true);
+                ui.set_sel_name(ss(f.name.clone()));
+                ui.set_sel_detail(ss(format!("{}:{}  ID {}", f.ip, f.port, short_id(&f.id))));
+                if self.sel_name != f.name {
+                    self.sel_name = f.name.clone();
+                    need_rebuild = true;
+                }
+            }
+            None => {
+                ui.set_has_sel(false);
+                self.sel_name.clear();
+            }
+        }
+        need_rebuild
+    }
+
+    fn sync_top(&self) {
+        let ui = self.ui();
+        let ips = if self.local_ips.is_empty() {
+            "…".to_string()
+        } else {
+            self.local_ips.join(" / ")
+        };
+        ui.set_self_line(ss(format!(
+            "本机「{}」  IP: {}  端口: {}  ID {}",
+            self.node.identity.name,
+            ips,
+            self.node.identity.port,
+            short_id(&self.node.identity.id)
+        )));
+        ui.set_fatal(ss(self.fatal.clone().unwrap_or_default()));
+    }
+
+    fn sync_status(&self) {
+        let ui = self.ui();
+        match &self.recv_progress {
+            Some((name, done, total)) => {
+                ui.set_recv_on(true);
+                ui.set_recv_label(ss(name.clone()));
+                ui.set_recv_frac(frac(*done, *total));
+                ui.set_recv_text(ss(format!("{} / {}", human(*done), human(*total))));
+            }
+            None => ui.set_recv_on(false),
+        }
+        match &self.send_progress {
+            Some((name, done, total)) => {
+                ui.set_send_on(true);
+                ui.set_send_label(ss(name.clone()));
+                ui.set_send_frac(frac(*done, *total));
+                ui.set_send_text_info(ss(format!("{} / {}", human(*done), human(*total))));
+            }
+            None => ui.set_send_on(false),
+        }
+        ui.set_status(ss(self.status.clone()));
+    }
+
+    /// 刷新"发现的设备"列表（添加好友对话框打开时每秒一次）
+    fn sync_found(&mut self) {
+        let found = self.disc.as_ref().map(|d| d.list()).unwrap_or_default();
+        let mut addrs = Vec::new();
+        let mut rows = Vec::new();
+        for c in found.iter().filter(|x| !self.friends.iter().any(|f| f.id == x.id)) {
+            addrs.push(SocketAddr::new(c.ip, c.port));
+            rows.push(FoundRow {
+                text: ss(format!("{}  {}:{}  ({})", c.name, c.ip, c.port, short_id(&c.id))),
+            });
+        }
+        self.found_addrs = addrs;
+        self.found_model.set_vec(rows);
+    }
+
+    fn sync_dialogs(&self) {
+        let ui = self.ui();
+
+        // 好友请求（一次只显示队首）
+        match self.pending_requests.first() {
+            Some((peer, _)) => {
+                ui.set_req_open(true);
+                ui.set_req_l1(ss(format!("「{}」想添加你为好友", peer.name)));
+                ui.set_req_l2(ss(format!(
+                    "IP: {}    设备ID: {}…（已通过签名验证）",
+                    peer.ip,
+                    short_id(&peer.id)
+                )));
+            }
+            None => ui.set_req_open(false),
+        }
+
+        // 收到文件
+        match self.pending_offers.first() {
+            Some(o) => {
+                let what = if o.summary.is_dir { "文件夹" } else { "文件" };
+                ui.set_offer_open(true);
+                ui.set_offer_l1(ss(format!("「{}」想发送{}：{}", o.from.name, what, o.summary.name)));
+                ui.set_offer_l2(ss(format!(
+                    "共 {} 个文件，{}",
+                    o.summary.file_count,
+                    human(o.summary.total_bytes)
+                )));
+                ui.set_offer_l3(ss(format!(
+                    "保存到：{}（可在设置里修改）",
+                    self.settings.save_dir.display()
+                )));
+            }
+            None => ui.set_offer_open(false),
+        }
+
+        // 添加好友
+        ui.set_add_open(self.add_open);
+        ui.set_add_busy(self.add_busy);
+        ui.set_add_error(ss(self.add_error.clone()));
+        ui.set_add_has_disc(self.disc.is_some());
+        ui.set_add_disc_error(ss(self.disc_error.clone().unwrap_or_default()));
+
+        // 设置
+        ui.set_settings_open(self.settings_open);
+        ui.set_settings_msg(ss(self.settings_msg.clone().unwrap_or_default()));
+
+        // 清空记录确认
+        match self.confirm_clear {
+            Some(id) => {
+                ui.set_clear_open(true);
+                ui.set_clear_text(ss(format!("确定清空与「{}」的全部聊天记录吗？", self.friend_name(&id))));
+            }
+            None => ui.set_clear_open(false),
+        }
+    }
+
+    fn sync_drop(&self) {
+        let ui = self.ui();
+        match &self.drop_confirm {
+            Some(paths) => {
+                let lines: Vec<SharedString> =
+                    paths.iter().take(8).map(|p| ss(p.display().to_string())).collect();
+                self.drop_model.set_vec(lines);
+                ui.set_drop_target(ss(self.selected_friend().map(|f| f.name).unwrap_or_default()));
+                ui.set_drop_more(ss(if paths.len() > 8 {
+                    format!("…共 {} 项", paths.len())
+                } else {
+                    String::new()
+                }));
+                ui.set_drop_open(true);
+            }
+            None => ui.set_drop_open(false),
+        }
+    }
+
+    fn sync_picker(&self, set_path: bool) {
+        let ui = self.ui();
+        let Some(p) = &self.picker else {
+            ui.set_picker_open(false);
+            return;
+        };
+        ui.set_picker_purpose(if p.purpose == PickPurpose::SendPath { 0 } else { 1 });
+        ui.set_picker_title(ss(match p.purpose {
+            PickPurpose::SendPath => "选择要发送的文件或文件夹",
+            PickPurpose::SaveDir => "选择接收目录",
+        }));
+        ui.set_picker_error(ss(p.error.clone()));
+        self.roots_model
+            .set_vec(p.roots.iter().map(|r| ss(r.clone())).collect::<Vec<_>>());
+        self.pick_model.set_vec(
+            p.rows
+                .iter()
+                .map(|r| PickRow { name: ss(r.name.clone()), is_dir: r.is_dir })
+                .collect::<Vec<_>>(),
+        );
+        if set_path {
+            ui.set_picker_path(ss(p.cwd().display().to_string()));
+        }
+        ui.set_picker_open(true);
+    }
+
+    /// 取走后台事件并刷新界面。界面线程里被 Waker、定时器和 App::start 调用
+    pub fn drain(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.on_event(ev);
+        }
+        if self.sync_friends() {
+            self.rebuild_messages();
+        }
+        if self.add_open {
+            self.sync_found();
+        }
+        self.sync_top();
+        self.sync_status();
+        self.sync_dialogs();
     }
 
     // ------------------------------------------------------------------ 事件
@@ -449,15 +772,16 @@ impl App {
             Event::AddFriendDone(res) => match res {
                 Ok(f) => {
                     logging::info(format!("已添加好友 {} ({})", f.name, short_id(&f.id)));
-                    self.add.open = false;
-                    self.add.busy = false;
-                    self.selected = Some(f.id);
+                    self.add_open = false;
+                    self.add_busy = false;
+                    self.sync_friends(); // 先让好友列表里有这个人，再选中
+                    self.set_selected(Some(f.id));
                     self.add_line(f.id, Who::Sys, "已添加为好友".to_string(), now_ms(), true);
                 }
                 Err(msg) => {
-                    self.add.busy = false;
-                    if self.add.open {
-                        self.add.error = msg;
+                    self.add_busy = false;
+                    if self.add_open {
+                        self.add_error = msg;
                     } else {
                         self.status = msg;
                     }
@@ -490,17 +814,19 @@ impl App {
     // ------------------------------------------------------------------ 后台任务
 
     fn start_add_friend(&mut self) {
-        let text = self.add.addr.trim().to_string();
-        let Some(addr) = parse_addr(&text) else {
-            self.add.error = "地址格式不对，应为 IP 或 IP:端口".to_string();
+        let text = self.ui().get_add_addr().to_string();
+        let Some(addr) = parse_addr(text.trim()) else {
+            self.add_error = "地址格式不对，应为 IP 或 IP:端口".to_string();
+            self.sync_dialogs();
             return;
         };
         logging::info(format!("发送好友请求到 {addr}"));
-        self.add.busy = true;
-        self.add.error.clear();
+        self.add_busy = true;
+        self.add_error.clear();
+        self.sync_dialogs();
         let node = Arc::clone(&self.node);
         let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
+        let wake = self.wake.clone();
         thread::spawn(move || {
             let r = node
                 .add_friend(addr)
@@ -509,7 +835,7 @@ impl App {
                 logging::warn(format!("添加好友失败: {m}"));
             }
             let _ = tx.send(Event::AddFriendDone(r));
-            ctx.request_repaint();
+            wake();
         });
     }
 
@@ -517,11 +843,11 @@ impl App {
         self.add_line(f.id, Who::Me, text.clone(), now_ms(), true);
         let node = Arc::clone(&self.node);
         let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
+        let wake = self.wake.clone();
         thread::spawn(move || {
             let r = node.send_text(&f, &text).map_err(|e| explain(&e, f.ip, f.port));
             let _ = tx.send(Event::SendDone { to: f, label: String::new(), result: r, ts: now_ms() });
-            ctx.request_repaint();
+            wake();
         });
     }
 
@@ -537,7 +863,7 @@ impl App {
         }
         let node = Arc::clone(&self.node);
         let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
+        let wake = self.wake.clone();
         thread::spawn(move || {
             for p in paths {
                 let label = file_label(&p);
@@ -557,7 +883,7 @@ impl App {
                         if due || done >= total {
                             last = Some(Instant::now());
                             let _ = tx.send(Event::SendProgress { to: f.name.clone(), done, total });
-                            ctx.request_repaint();
+                            wake();
                         }
                     })
                     .map_err(|e| explain(&e, f.ip, f.port));
@@ -565,484 +891,152 @@ impl App {
                     logging::warn(format!("发送 {label} 失败: {m}"));
                 }
                 let _ = tx.send(Event::SendDone { to: f.clone(), label, result: r, ts: now_ms() });
-                ctx.request_repaint();
+                wake();
             }
         });
     }
 
-    // ------------------------------------------------------------------ 动作
+    // ------------------------------------------------------------------ 界面动作（callback 调用）
 
-    fn apply(&mut self, a: Act, friends: &[Friend]) {
-        match a {
-            Act::Select(id) => {
-                self.selected = Some(id);
-                self.unread.remove(&id);
-                self.ensure_loaded(id);
-            }
-            Act::OpenAdd(addr) => {
-                self.add = AddDialog { open: true, addr, busy: false, error: String::new() };
-                if let Some(d) = &self.disc {
-                    d.scan();
-                }
-            }
-            Act::Remove(id) => {
-                let _ = self.node.friends.remove(&id);
-                self.online.remove(&id);
-                if self.selected == Some(id) {
-                    self.selected = None;
-                }
-            }
-            Act::SendText => {
-                if let Some(f) = self.selected_friend(friends) {
-                    let text = self.input.trim().to_string();
-                    if !text.is_empty() {
-                        self.input.clear();
-                        self.send_text(f, text);
-                    }
-                }
-            }
-            Act::OpenPicker(purpose) => {
-                let start = match purpose {
-                    PickPurpose::SendPath => self.last_dir.clone(),
-                    PickPurpose::SaveDir => PathBuf::from(self.save_dir_edit.trim()),
-                };
-                self.picker = Some(Picker::new(purpose, start));
-            }
-            Act::OpenSettings => {
-                if let Ok(me) = Identity::load_or_create(None, None) {
-                    self.name_edit = me.name;
-                    self.port_edit = me.port.to_string();
-                } else {
-                    self.name_edit = self.node.identity.name.clone();
-                    self.port_edit = self.node.identity.port.to_string();
-                }
-                self.save_dir_edit = self.settings.save_dir.display().to_string();
-                self.disc_edit = self.settings.discoverable;
-                self.dnd_edit = self.settings.dnd;
-                self.settings_msg = None;
-                self.settings_open = true;
-            }
-            Act::AskClear(id) => self.confirm_clear = Some(id),
+    fn act_select(&mut self, idx: i32) {
+        if let Some(f) = self.friends.get(idx as usize) {
+            let id = f.id;
+            self.set_selected(Some(id));
         }
     }
 
-    fn on_picked(&mut self, purpose: PickPurpose, path: PathBuf, friends: &[Friend]) {
-        match purpose {
-            PickPurpose::SendPath => {
-                if let Some(f) = self.selected_friend(friends) {
-                    self.send_paths(f, vec![path]);
-                }
-            }
-            PickPurpose::SaveDir => {
-                self.save_dir_edit = path.display().to_string();
-            }
+    fn act_open_add(&mut self) {
+        self.add_open = true;
+        self.add_busy = false;
+        self.add_error.clear();
+        self.ui().set_add_addr(ss(""));
+        if let Some(d) = &self.disc {
+            d.scan();
+        }
+        self.sync_found();
+        self.sync_dialogs();
+    }
+
+    fn act_remove_friend(&mut self, idx: i32) {
+        let Some(id) = self.friends.get(idx as usize).map(|f| f.id) else { return };
+        let _ = self.node.friends.remove(&id);
+        self.online.remove(&id);
+        if self.selected == Some(id) {
+            self.selected = None;
+        }
+        self.sync_friends();
+        self.rebuild_messages();
+    }
+
+    fn act_ask_clear(&mut self, idx: i32) {
+        if let Some(id) = self.friends.get(idx as usize).map(|f| f.id) {
+            self.confirm_clear = Some(id);
+            self.sync_dialogs();
         }
     }
 
-    fn handle_drops(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect()
-        });
-        if !dropped.is_empty() {
-            self.drop_confirm = Some(dropped);
+    fn act_ask_clear_sel(&mut self) {
+        if let Some(id) = self.selected {
+            self.confirm_clear = Some(id);
+            self.sync_dialogs();
         }
     }
 
-    // ------------------------------------------------------------------ 面板
-
-    fn top_bar(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
-        egui::Panel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("局域网传输");
-                ui.separator();
-                let ips = if self.local_ips.is_empty() {
-                    "…".to_string()
-                } else {
-                    self.local_ips.join(" / ")
-                };
-                ui.label(format!(
-                    "本机「{}」  IP: {}  端口: {}  ID {}",
-                    self.node.identity.name,
-                    ips,
-                    self.node.identity.port,
-                    short_id(&self.node.identity.id)
-                ));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("设置").clicked() {
-                        acts.push(Act::OpenSettings);
-                    }
-                });
-            });
-            if let Some(msg) = &self.fatal {
-                ui.colored_label(RED, msg.as_str());
+    fn act_clear_answer(&mut self, yes: bool) {
+        if let Some(id) = self.confirm_clear.take() {
+            if yes {
+                self.clear_history(id);
             }
-        });
+        }
+        self.sync_dialogs();
     }
 
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        egui::Panel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some((name, done, total)) = &self.recv_progress {
-                    ui.label(format!("接收（{name}）"));
-                    ui.add(
-                        egui::ProgressBar::new(frac(*done, *total))
-                            .desired_width(200.0)
-                            .text(format!("{} / {}", human(*done), human(*total))),
-                    );
-                }
-                if let Some((name, done, total)) = &self.send_progress {
-                    ui.label(format!("发送（{name}）"));
-                    ui.add(
-                        egui::ProgressBar::new(frac(*done, *total))
-                            .desired_width(200.0)
-                            .text(format!("{} / {}", human(*done), human(*total))),
-                    );
-                }
-                if !self.status.is_empty() {
-                    ui.colored_label(RED, self.status.as_str());
-                    if ui.small_button("清除").clicked() {
-                        self.status.clear();
-                    }
-                }
-            });
-        });
-    }
-
-    fn side_panel(&mut self, ctx: &egui::Context, friends: &[Friend], acts: &mut Vec<Act>) {
-        egui::Panel::left("friends")
-            .default_size(230.0)
-            .min_size(180.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                if ui.button("+ 添加好友").clicked() {
-                    acts.push(Act::OpenAdd(String::new()));
-                }
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if friends.is_empty() {
-                        ui.weak("还没有好友");
-                    }
-                    for f in friends {
-                        let selected = self.selected == Some(f.id);
-                        let unread = self.unread.get(&f.id).copied().unwrap_or(0);
-                        let online = self.online.get(&f.id).copied().unwrap_or(false);
-                        ui.horizontal(|ui| {
-                            dot(ui, if online { GREEN } else { Color32::GRAY });
-                            let title = if unread > 0 {
-                                format!("{} ({})", f.name, unread)
-                            } else {
-                                f.name.clone()
-                            };
-                            let resp = ui.selectable_label(selected, title);
-                            if resp.clicked() {
-                                acts.push(Act::Select(f.id));
-                            }
-                            resp.context_menu(|ui| {
-                                if ui.button("清空聊天记录").clicked() {
-                                    acts.push(Act::AskClear(f.id));
-                                    ui.close();
-                                }
-                                if ui.button("删除好友").clicked() {
-                                    acts.push(Act::Remove(f.id));
-                                    ui.close();
-                                }
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add_space(18.0);
-                            ui.weak(format!("{}:{}", f.ip, f.port));
-                        });
-                        ui.add_space(2.0);
-                    }
-                });
-            });
-    }
-    
-    fn input_panel(&mut self, ctx: &egui::Context, friends: &[Friend], acts: &mut Vec<Act>) {
-        if self.selected_friend(friends).is_none() {
+    fn act_send_text(&mut self, text: String) {
+        let Some(f) = self.selected_friend() else { return };
+        let text = text.trim().to_string();
+        if text.is_empty() {
             return;
         }
-        let input_id = egui::Id::new("chat_input");
-        const MIN_H: f32 = 110.0;
-        const MAX_H: f32 = 450.0;
-        //const OVERHEAD: f32 = 105.0; // 分隔条 + 按钮行 + 发送行 + 边距，用于算文本区高度
-
-        egui::Panel::bottom("input")
-            .exact_size(self.input_height)
-            .show(ctx, |ui| {
-                // —— 顶部拖拽条：向上拖变高，向下拖变矮
-                let (hrect, hresp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 8.0),
-                    egui::Sense::drag(),
-                );
-                if hresp.hovered() || hresp.dragged() {
-                    ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                }
-                if hresp.dragged() {
-                    self.input_height =
-                        (self.input_height - hresp.drag_delta().y).clamp(MIN_H, MAX_H);
-                }
-                let stroke = if hresp.hovered() || hresp.dragged() {
-                    ui.visuals().widgets.hovered.bg_stroke
-                } else {
-                    ui.visuals().widgets.noninteractive.bg_stroke
-                };
-                ui.painter()
-                    .line_segment([hrect.left_center(), hrect.right_center()], stroke);
-
-                ui.horizontal(|ui| {
-                    if ui.button("发送文件/文件夹").clicked() {
-                        acts.push(Act::OpenPicker(PickPurpose::SendPath));
-                    }
-                    ui.weak("也可以把文件或文件夹直接拖进窗口");
-                });
-
-                // —— 跟踪输入法组词状态
-                let has_focus_now = ui.memory(|m| m.has_focus(input_id)); // 闭包外取
-                let ime_events: Vec<egui::ImeEvent> = ui.input(|i| {
-                    i.events
-                        .iter()
-                        .filter_map(|e| match e {
-                            egui::Event::Ime(ev) => Some(ev.clone()),
-                            _ => None,
-                        })
-                        .collect()
-                });
-
-                let mut ime_event_this_frame = false;
-                let mut composing = self.ime_composing;
-                for ev in &ime_events {
-                    logging::info(format!("IME事件: {ev:?}  focus={has_focus_now}"));
-                    ime_event_this_frame = true;
-                    match ev {
-                        egui::ImeEvent::Preedit(s) => composing = !s.is_empty(),
-                        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => composing = false,
-                        egui::ImeEvent::Enabled => {}
-                    }
-                }
-                self.ime_composing = composing;
-
-                // —— 回车发送，Shift+回车换行。必须在 TextEdit 之前处理
-                let has_focus = ui.memory(|m| m.has_focus(input_id));
-                let mut send = false;
-                if has_focus && !self.ime_composing && !ime_event_this_frame {
-                    send = ui.input_mut(|i| {
-                        // 显式排除 Shift：consume_key 对多按的 Shift 是宽松匹配的
-                        !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                    });
-                }
-
-                // —— 文本区：占满面板剩余高度，只给下面的"发送"行留位置
-                let send_row_h = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-                let area_h = (ui.available_height() - send_row_h).max(36.0);
-                let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                let rows = (((area_h - 8.0) / row_h).floor() as usize).max(1); // 8.0 是文本框自身的上下内边距
-                egui::ScrollArea::vertical()
-                    .max_height(area_h)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.input)
-                                .id(input_id)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(rows)
-                                .hint_text("输入文字，回车发送，Shift+回车换行"),
-                        );
-                    });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("发送").clicked() {
-                        send = true;
-                    }
-                });
-
-                if send && !self.input.trim().is_empty() {
-                    acts.push(Act::SendText);
-                    ui.memory_mut(|m| m.request_focus(input_id)); // 发送后保持焦点
-                }
-            });
+        self.ui().set_input_text(ss(""));
+        self.send_text(f, text);
     }
 
-    fn central(&mut self, ctx: &egui::Context, friends: &[Friend], acts: &mut Vec<Act>) {
-        let sel = self.selected_friend(friends);
-        let sel_id = sel.as_ref().map(|f| f.id);
-        let mut del: Option<usize> = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(f) = sel else {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("在左侧选择好友，或点击“+ 添加好友”");
-                });
-                return;
-            };
-            ui.horizontal(|ui| {
-                ui.heading(f.name.as_str());
-                ui.weak(format!("{}:{}  ID {}", f.ip, f.port, short_id(&f.id)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("清空记录").clicked() {
-                        acts.push(Act::AskClear(f.id));
-                    }
-                });
-            });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    // 气泡最宽占聊天区的 70%
-                    let max_w = (ui.available_width() * 0.7).max(120.0);
-                    let now = now_ms();
-                    let Some(lines) = self.logs.get(&f.id) else {
-                        return;
-                    };
-                    for (i, l) in lines.iter().enumerate() {
-                        let when = format_ts(l.ts, now);
-                        match l.who {
-                            // 系统提示：居中、灰色
-                            Who::Sys => {
-                                ui.vertical_centered(|ui| {
-                                    ui.weak(format!("{}  {}", when, l.text));
-                                });
-                            }
-                            // 我方靠右（蓝底白字），对方靠左（灰底）；气泡上方是"名字  时间"
-                            Who::Me | Who::Peer => {
-                                let me = l.who == Who::Me;
-                                let (fill, text_color) = if me {
-                                    (BLUE, Color32::WHITE)
-                                } else {
-                                    (ui.visuals().widgets.inactive.bg_fill, ui.visuals().text_color())
-                                };
-                                let name = if me { "我" } else { f.name.as_str() };
-                                let head = format!("{}  {}", name, when);
-                                let avail = ui.available_width();
+    fn act_open_picker_send(&mut self) {
+        self.picker = Some(Picker::new(PickPurpose::SendPath, self.last_dir.clone()));
+        self.sync_picker(true);
+    }
 
-                                // 先量出文字和名字行实际占的宽度，才能算出右对齐要空出多少
-                                let body = egui::TextStyle::Body.resolve(ui.style());
-                                let small = egui::TextStyle::Small.resolve(ui.style());
-                                let text_w = ui
-                                    .painter()
-                                    .layout(l.text.clone(), body, text_color, max_w - 20.0)
-                                    .size()
-                                    .x
-                                    .ceil()
-                                    + 2.0;
-                                let head_w = ui
-                                    .painter()
-                                    .layout_no_wrap(head.clone(), small, text_color)
-                                    .size()
-                                    .x
-                                    .ceil()
-                                    + 2.0;
-                                let bubble_w = text_w + 20.0; // 20 = 左右 inner_margin 各 10
-                                let off = |w: f32| if me { (avail - w - 6.0).max(0.0) } else { 0.0 };
-
-                                ui.horizontal(|ui| {
-                                    ui.add_space(off(head_w));
-                                    ui.label(egui::RichText::new(head.as_str()).small().weak());
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.add_space(off(bubble_w));
-                                    let inner = egui::Frame::NONE
-                                        .fill(fill)
-                                        .corner_radius(8.0)
-                                        .inner_margin(egui::Margin::symmetric(10, 6))
-                                        .show(ui, |ui| {
-                                            ui.set_width(text_w);
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(l.text.as_str()).color(text_color),
-                                                )
-                                                .wrap_mode(egui::TextWrapMode::Wrap),
-                                            );
-                                        });
-                                    let resp = ui.interact(
-                                        inner.response.rect,
-                                        ui.id().with(("bubble", i)),
-                                        egui::Sense::click(),
-                                    );
-                                    resp.context_menu(|ui| {
-                                        if ui.button("删除这条").clicked() {
-                                            del = Some(i);
-                                            ui.close();
-                                        }
-                                    });
-                                });
-                            }
-                        }
-                        ui.add_space(4.0);
-                    }
-                });
-        });
-        if let (Some(i), Some(id)) = (del, sel_id) {
-            self.delete_line(id, i);
+    fn act_open_settings(&mut self) {
+        let ui = self.ui();
+        if let Ok(me) = Identity::load_or_create(None, None) {
+            ui.set_name_edit(ss(me.name));
+            ui.set_port_edit(ss(me.port.to_string()));
+        } else {
+            ui.set_name_edit(ss(self.node.identity.name.clone()));
+            ui.set_port_edit(ss(self.node.identity.port.to_string()));
         }
+        ui.set_savedir_edit(ss(self.settings.save_dir.display().to_string()));
+        ui.set_disc_edit(self.settings.discoverable);
+        ui.set_dnd_edit(self.settings.dnd);
+        ui.set_device_id(ss(id_to_hex(&self.node.identity.id)));
+        self.settings_msg = None;
+        self.settings_open = true;
+        self.sync_dialogs();
     }
 
-    // ------------------------------------------------------------------ 对话框
-
-    fn dialogs(&mut self, ctx: &egui::Context, friends: &[Friend]) {
-        self.dialog_friend_request(ctx);
-        self.dialog_offer(ctx);
-        self.dialog_add(ctx, friends);
-        self.dialog_settings(ctx);
-        self.dialog_drop(ctx, friends);
-        self.dialog_clear(ctx, friends);
-        self.dialog_picker(ctx, friends);
-    }
-
-    fn dialog_friend_request(&mut self, ctx: &egui::Context) {
-        let first = self.pending_requests.first().map(|(p, _)| p.clone());
-        let Some(peer) = first else { return };
-        let mut decision: Option<bool> = None;
-        egui::Window::new("好友请求")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!("「{}」想添加你为好友", peer.name));
-                ui.label(format!("IP: {}    设备ID: {}…（已通过签名验证）", peer.ip, short_id(&peer.id)));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("同意").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("拒绝").clicked() {
-                        decision = Some(false);
-                    }
+    fn act_settings_save(&mut self) {
+        let ui = self.ui();
+        let name = ui.get_name_edit().trim().to_string();
+        let port_text = ui.get_port_edit().to_string();
+        let save_dir = PathBuf::from(ui.get_savedir_edit().trim());
+        let disc_on = ui.get_disc_edit();
+        let dnd_on = ui.get_dnd_edit();
+        match port_text.trim().parse::<u16>() {
+            Ok(port) if port >= 1024 && !name.is_empty() => {
+                let r1 = Identity::load_or_create(Some(name.as_str()), Some(port));
+                self.settings.save_dir = save_dir;
+                self.settings.discoverable = disc_on;
+                self.settings.dnd = dnd_on;
+                let r2 = self.settings.save();
+                if let Some(d) = &self.disc {
+                    d.set_visible(disc_on);
+                }
+                tray_ipc::DND.store(dnd_on, Ordering::Relaxed);
+                tray_ipc::set_recv_dir(&self.settings.save_dir.display().to_string());
+                crate::events::set_save_dir(&self.settings.save_dir);
+                tray_ipc::publish_status();
+                logging::info("设置已保存");
+                self.settings_msg = Some(match (r1, r2) {
+                    (Ok(_), Ok(())) => "已保存。名字和端口需重启程序后生效".to_string(),
+                    (Err(e), _) | (_, Err(e)) => format!("保存失败：{e}"),
                 });
-            });
-        if let Some(d) = decision {
+            }
+            _ => {
+                self.settings_msg = Some("名字不能为空，端口需在 1024–65535 之间".to_string());
+            }
+        }
+        self.sync_dialogs();
+    }
+
+    fn act_settings_browse(&mut self) {
+        let start = PathBuf::from(self.ui().get_savedir_edit().trim());
+        self.picker = Some(Picker::new(PickPurpose::SaveDir, start));
+        self.sync_picker(true);
+    }
+
+    fn act_req_answer(&mut self, yes: bool) {
+        if !self.pending_requests.is_empty() {
             let (_, reply) = self.pending_requests.remove(0);
-            let _ = reply.send(d);
+            let _ = reply.send(yes);
         }
+        self.sync_dialogs();
     }
 
-    fn dialog_offer(&mut self, ctx: &egui::Context) {
-        let first = self.pending_offers.first().map(|o| (o.from.clone(), o.summary.clone()));
-        let Some((from, summary)) = first else { return };
-        let save_dir = self.settings.save_dir.clone();
-        let mut decision: Option<bool> = None;
-        egui::Window::new("收到文件")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                let what = if summary.is_dir { "文件夹" } else { "文件" };
-                ui.label(format!("「{}」想发送{}：{}", from.name, what, summary.name));
-                ui.label(format!("共 {} 个文件，{}", summary.file_count, human(summary.total_bytes)));
-                ui.weak(format!("保存到：{}（可在设置里修改）", save_dir.display()));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("接收").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("拒绝").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        if let Some(d) = decision {
+    fn act_offer_answer(&mut self, yes: bool) {
+        if !self.pending_offers.is_empty() {
             let offer = self.pending_offers.remove(0);
-            if d {
+            let save_dir = self.settings.save_dir.clone();
+            if yes {
                 self.add_line(offer.from.id, Who::Sys, format!("开始接收：{}", offer.summary.name), now_ms(), false);
                 let _ = offer.reply.send(Some(save_dir));
             } else {
@@ -1050,352 +1044,180 @@ impl App {
                 let _ = offer.reply.send(None);
             }
         }
+        self.sync_dialogs();
     }
 
-    fn dialog_add(&mut self, ctx: &egui::Context, friends: &[Friend]) {
-        if !self.add.open {
+    fn act_add_pick(&mut self, idx: i32) {
+        if self.add_busy {
             return;
         }
-        ctx.request_repaint_after(Duration::from_secs(1)); // 让发现列表自己刷新
-        let found: Vec<Found> = self.disc.as_ref().map(|d| d.list()).unwrap_or_default();
-        let candidates: Vec<&Found> = found
-            .iter()
-            .filter(|x| !friends.iter().any(|f| f.id == x.id))
-            .collect();
-        let mut submit = false;
-        let mut close = false;
-        let mut scan = false;
-        let mut pick: Option<SocketAddr> = None;
-        egui::Window::new("添加好友")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label("方式一：从局域网里发现的设备中选择");
-                ui.horizontal(|ui| {
-                    if ui.button("重新扫描").clicked() {
-                        scan = true;
-                    }
-                    if let Some(m) = &self.disc_error {
-                        ui.colored_label(RED, m.as_str());
-                    }
-                });
-                if self.disc.is_some() && candidates.is_empty() {
-                    ui.weak("暂时没发现其他设备（对方需要运行本程序，并在设置里允许被发现）");
-                }
-                egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                    for c in &candidates {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("{}  {}:{}  ({})", c.name, c.ip, c.port, short_id(&c.id)));
-                            if ui.add_enabled(!self.add.busy, egui::Button::new("添加")).clicked() {
-                                pick = Some(SocketAddr::new(c.ip, c.port));
-                            }
-                        });
-                    }
-                });
-                ui.separator();
-                ui.label("方式二：输入对方的 IP（端口不是默认值时写成 IP:端口）");
-                let resp = ui.add_enabled(
-                    !self.add.busy,
-                    egui::TextEdit::singleline(&mut self.add.addr)
-                        .desired_width(300.0)
-                        .hint_text("例如 192.168.1.5"),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
-                }
-                if self.add.busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("已发送请求，等待对方点“同意”（最长 2 分钟）…");
-                    });
-                }
-                if !self.add.error.is_empty() {
-                    ui.colored_label(RED, self.add.error.as_str());
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.add.busy, egui::Button::new("发送请求"))
-                        .clicked()
-                    {
-                        submit = true;
-                    }
-                    if ui.button("关闭").clicked() {
-                        close = true;
-                    }
-                });
-            });
-        if scan {
-            if let Some(d) = &self.disc {
-                d.scan();
-            }
-        }
-        if close {
-            self.add.open = false;
-        } else if let Some(a) = pick {
-            if !self.add.busy {
-                self.add.addr = a.to_string();
-                self.start_add_friend();
-            }
-        } else if submit && !self.add.busy {
+        if let Some(addr) = self.found_addrs.get(idx as usize).copied() {
+            self.ui().set_add_addr(ss(addr.to_string()));
             self.start_add_friend();
         }
     }
 
-    fn dialog_settings(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-        let mut save = false;
-        let mut close = false;
-        let mut browse = false;
-        egui::Window::new("设置")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                egui::Grid::new("settings_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("本机名字");
-                        ui.text_edit_singleline(&mut self.name_edit);
-                        ui.end_row();
-
-                        ui.label("监听端口");
-                        ui.text_edit_singleline(&mut self.port_edit);
-                        ui.end_row();
-
-                        ui.label("接收目录");
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.save_dir_edit);
-                            if ui.button("浏览").clicked() {
-                                browse = true;
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("设备ID");
-                        ui.label(id_to_hex(&self.node.identity.id));
-                        ui.end_row();
-                    });
-                ui.checkbox(&mut self.disc_edit, "允许被局域网发现（定时广播自己的名字和端口）");
-                ui.checkbox(&mut self.dnd_edit, "免打扰（不弹托盘通知，也不自动弹出窗口）");
-                ui.weak("名字和端口修改后需要重启程序才生效；设备ID是公钥，改名换 IP 都不影响好友关系");
-                if let Some(m) = &self.settings_msg {
-                    ui.label(m.as_str());
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("保存").clicked() {
-                        save = true;
-                    }
-                    if ui.button("关闭").clicked() {
-                        close = true;
-                    }
-                });
-            });
-
-        if browse {
-            let start = PathBuf::from(self.save_dir_edit.trim());
-            self.picker = Some(Picker::new(PickPurpose::SaveDir, start));
-        }
-        if save {
-            let name = self.name_edit.trim().to_string();
-            match self.port_edit.trim().parse::<u16>() {
-                Ok(port) if port >= 1024 && !name.is_empty() => {
-                    let r1 = Identity::load_or_create(Some(name.as_str()), Some(port));
-                    self.settings.save_dir = PathBuf::from(self.save_dir_edit.trim());
-                    self.settings.discoverable = self.disc_edit;
-                    self.settings.dnd = self.dnd_edit;
-                    let r2 = self.settings.save();
-                    if let Some(d) = &self.disc {
-                        d.set_visible(self.disc_edit);
-                    }
-                    tray_ipc::DND.store(self.dnd_edit, Ordering::Relaxed);
-                    tray_ipc::set_recv_dir(&self.settings.save_dir.display().to_string());
-                    crate::events::set_save_dir(&self.settings.save_dir);
-                    tray_ipc::publish_status();
-                    logging::info("设置已保存");
-                    self.settings_msg = Some(match (r1, r2) {
-                        (Ok(_), Ok(())) => "已保存。名字和端口需重启程序后生效".to_string(),
-                        (Err(e), _) | (_, Err(e)) => format!("保存失败：{e}"),
-                    });
-                }
-                _ => {
-                    self.settings_msg = Some("名字不能为空，端口需在 1024–65535 之间".to_string());
-                }
-            }
-        }
-        if close {
-            self.settings_open = false;
+    fn act_add_submit(&mut self) {
+        if !self.add_busy {
+            self.start_add_friend();
         }
     }
 
-    fn dialog_drop(&mut self, ctx: &egui::Context, friends: &[Friend]) {
-        let Some(paths) = self.drop_confirm.clone() else {
-            return;
-        };
-        let target = self.selected_friend(friends);
-        let mut decision: Option<bool> = None;
-        egui::Window::new("发送拖入的内容")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                match &target {
-                    Some(f) => {
-                        ui.label(format!("发送给「{}」：", f.name));
-                    }
-                    None => {
-                        ui.label("请先在左侧选择一个好友，再拖入文件");
-                    }
-                }
-                for p in paths.iter().take(8) {
-                    ui.label(p.display().to_string());
-                }
-                if paths.len() > 8 {
-                    ui.weak(format!("…共 {} 项", paths.len()));
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(target.is_some(), egui::Button::new("发送")).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("取消").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                self.drop_confirm = None;
-                if let Some(f) = target {
-                    self.send_paths(f, paths);
-                }
-            }
-            Some(false) => self.drop_confirm = None,
-            None => {}
+    fn act_add_scan(&mut self) {
+        if let Some(d) = &self.disc {
+            d.scan();
         }
     }
 
-    fn dialog_clear(&mut self, ctx: &egui::Context, friends: &[Friend]) {
-        let Some(id) = self.confirm_clear else {
-            return;
-        };
-        let name = friends
-            .iter()
-            .find(|f| f.id == id)
-            .map(|f| f.name.clone())
-            .unwrap_or_else(|| short_id(&id));
-        let mut decision: Option<bool> = None;
-        egui::Window::new("清空聊天记录")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!("确定清空与「{name}」的全部聊天记录吗？"));
-                ui.weak("记录会从本机删除，无法恢复（对方电脑上的记录不受影响）。");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("清空").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("取消").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                self.clear_history(id);
-                self.confirm_clear = None;
+    fn act_add_close(&mut self) {
+        self.add_open = false;
+        self.sync_dialogs();
+    }
+
+    pub fn set_drop_confirm(&mut self, paths: Vec<PathBuf>) {
+        self.drop_confirm = Some(paths);
+        self.sync_drop();
+    }
+
+    fn act_drop_answer(&mut self, yes: bool) {
+        let paths = self.drop_confirm.take();
+        if yes {
+            if let (Some(paths), Some(f)) = (paths, self.selected_friend()) {
+                self.send_paths(f, paths);
             }
-            Some(false) => self.confirm_clear = None,
-            None => {}
+        }
+        self.sync_drop();
+    }
+
+    fn act_delete_msg(&mut self, idx: i32) {
+        if let Some(id) = self.selected {
+            self.delete_line(id, idx as usize);
         }
     }
 
-    fn dialog_picker(&mut self, ctx: &egui::Context, friends: &[Friend]) {
-        let mut outcome = PickOutcome::None;
-        let mut purpose = PickPurpose::SendPath;
-        let mut cwd = PathBuf::new();
+    fn act_picker_goto(&mut self, text: String) {
         if let Some(p) = self.picker.as_mut() {
-            outcome = p.show(ctx);
-            purpose = p.purpose;
-            cwd = p.cwd().to_path_buf();
+            p.go(PathBuf::from(text.trim()));
+            let ok = p.error.is_empty();
+            self.sync_picker(ok);
         }
-        match outcome {
-            PickOutcome::None => {}
-            PickOutcome::Cancel => self.picker = None,
-            PickOutcome::Chosen(path) => {
-                self.picker = None;
-                if purpose == PickPurpose::SendPath && !cwd.as_os_str().is_empty() {
-                    self.last_dir = cwd;
+    }
+
+    fn act_picker_up(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            p.up();
+            let ok = p.error.is_empty();
+            self.sync_picker(ok);
+        }
+    }
+
+    fn act_picker_home(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            p.home();
+            let ok = p.error.is_empty();
+            self.sync_picker(ok);
+        }
+    }
+
+    /// 点某一行：目录 = 进入；文件（仅"选要发送的内容"时）= 直接选中
+    fn act_picker_row(&mut self, idx: i32) {
+        let Some(p) = self.picker.as_mut() else { return };
+        let idx = idx as usize;
+        let Some(row) = p.rows.get(idx) else { return };
+        let is_dir = row.is_dir;
+        let Some(path) = p.path_of(idx) else { return };
+        if is_dir {
+            p.go(path);
+            let ok = p.error.is_empty();
+            self.sync_picker(ok);
+        } else if p.purpose == PickPurpose::SendPath {
+            self.picker_chosen(path);
+        }
+    }
+
+    /// 目录行右边的"选择"按钮（仅"选要发送的内容"时有）
+    fn act_picker_choose_row(&mut self, idx: i32) {
+        let Some(p) = self.picker.as_ref() else { return };
+        if let Some(path) = p.path_of(idx as usize) {
+            self.picker_chosen(path);
+        }
+    }
+
+    fn act_picker_choose_current(&mut self) {
+        let Some(p) = self.picker.as_ref() else { return };
+        let path = p.cwd().to_path_buf();
+        self.picker_chosen(path);
+    }
+
+    fn act_picker_cancel(&mut self) {
+        self.picker = None;
+        self.sync_picker(false);
+    }
+
+    fn picker_chosen(&mut self, path: PathBuf) {
+        let Some(p) = self.picker.take() else { return };
+        let cwd = p.cwd().to_path_buf();
+        if p.purpose == PickPurpose::SendPath && !cwd.as_os_str().is_empty() {
+            self.last_dir = cwd;
+        }
+        self.sync_picker(false);
+        match p.purpose {
+            PickPurpose::SendPath => {
+                if let Some(f) = self.selected_friend() {
+                    self.send_paths(f, vec![path]);
                 }
-                self.on_picked(purpose, path, friends);
+            }
+            PickPurpose::SaveDir => {
+                self.ui().set_savedir_edit(ss(path.display().to_string()));
             }
         }
     }
 }
 
-// ------------------------------------------------------------------ eframe 入口
-
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        winctl::cache_hwnd(frame);
-        if !self.first_frame_done {
-            self.first_frame_done = true;
-            logging::info("首帧渲染完成");
-            if self.tray && !self.show_at_start && !tray_ipc::WANT_SHOW.load(Ordering::Relaxed) {
-                logging::info("托盘模式：启动后自动隐藏主窗口（点托盘图标显示）");
-                // winctl::hide(ctx);
-                logging::info("测试暂不隐藏");
-            }
-        }
-        
-        // 托盘模式下点关闭按钮 = 隐藏到托盘，程序继续在后台收消息；退出走托盘菜单
-        if ctx.input(|i| i.viewport().close_requested()) {
-            if self.tray {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                winctl::hide(ctx);
-                logging::info("点击关闭 → 隐藏到托盘（程序继续在后台运行）");
-            } else {
-                logging::info("点击关闭 → 退出");
-            }
-        }
-
-        // 窗口回到前台：托盘角标的未读数清零
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        tray_ipc::FOCUSED.store(focused, Ordering::Relaxed);
-        if focused && tray_ipc::UNREAD.swap(0, Ordering::Relaxed) > 0 {
-            tray_ipc::publish_unread();
-        }
-
-        while let Ok(ev) = self.rx.try_recv() {
-            self.on_event(ev);
-        }
-        self.handle_drops(ctx);
+/// 把 .slint 里的所有 callback 接到 App 的方法上
+fn wire(app: &Shared, ui: &MainWindow) {
+    macro_rules! bind {
+        ($on:ident, |$a:ident $(, $arg:ident : $ty:ty)*| $body:expr) => {{
+            let shared = app.clone();
+            ui.$on(move |$($arg : $ty),*| {
+                let mut $a = shared.borrow_mut();
+                $body
+            });
+        }};
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let _ = frame; // 暂时不需要
-        let ctx = ui.ctx();
-
-        let friends = self.node.friends.list();
-        let mut acts: Vec<Act> = Vec::new();
-
-        // 面板的声明顺序决定布局：先上下，再左侧，最后中间
-        self.top_bar(ctx, &mut acts);
-        self.status_bar(ctx);
-        self.side_panel(ctx, &friends, &mut acts);
-        self.input_panel(ctx, &friends, &mut acts);
-        self.central(ctx, &friends, &mut acts);
-        self.dialogs(ctx, &friends);
-
-        for a in acts {
-            self.apply(a, &friends);
-        }
-    }
+    bind!(on_select, |a, i: i32| a.act_select(i));
+    bind!(on_open_add, |a| a.act_open_add());
+    bind!(on_remove_friend, |a, i: i32| a.act_remove_friend(i));
+    bind!(on_ask_clear, |a, i: i32| a.act_ask_clear(i));
+    bind!(on_ask_clear_sel, |a| a.act_ask_clear_sel());
+    bind!(on_send_text, |a, t: SharedString| a.act_send_text(t.to_string()));
+    bind!(on_open_picker_send, |a| a.act_open_picker_send());
+    bind!(on_open_settings, |a| a.act_open_settings());
+    bind!(on_req_answer, |a, y: bool| a.act_req_answer(y));
+    bind!(on_offer_answer, |a, y: bool| a.act_offer_answer(y));
+    bind!(on_add_pick, |a, i: i32| a.act_add_pick(i));
+    bind!(on_add_submit, |a| a.act_add_submit());
+    bind!(on_add_scan, |a| a.act_add_scan());
+    bind!(on_add_close, |a| a.act_add_close());
+    bind!(on_settings_save, |a| a.act_settings_save());
+    bind!(on_settings_close, |a| {
+        a.settings_open = false;
+        a.sync_dialogs();
+    });
+    bind!(on_settings_browse, |a| a.act_settings_browse());
+    bind!(on_drop_answer, |a, y: bool| a.act_drop_answer(y));
+    bind!(on_clear_answer, |a, y: bool| a.act_clear_answer(y));
+    bind!(on_picker_goto, |a, t: SharedString| a.act_picker_goto(t.to_string()));
+    bind!(on_picker_up, |a| a.act_picker_up());
+    bind!(on_picker_home, |a| a.act_picker_home());
+    bind!(on_picker_row, |a, i: i32| a.act_picker_row(i));
+    bind!(on_picker_choose_row, |a, i: i32| a.act_picker_choose_row(i));
+    bind!(on_picker_choose_current, |a| a.act_picker_choose_current());
+    bind!(on_picker_cancel, |a| a.act_picker_cancel());
+    bind!(on_delete_msg, |a, i: i32| a.act_delete_msg(i));
+    bind!(on_clear_status, |a| {
+        a.status.clear();
+        a.sync_status();
+    });
 }

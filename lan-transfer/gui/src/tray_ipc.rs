@@ -10,11 +10,10 @@
 //!   {"event":"message","from":"张三","preview":"你好"}
 //!   {"event":"transfer","name":"a.zip","percent":42}
 //!
-//! 所有这些都不经过界面线程：窗口隐藏时 egui 不刷新，所以托盘事件、聊天记录
-//! 落盘都由网络线程直接完成，界面只负责"看"。
+//! 所有这些都不经过界面线程：托盘事件、聊天记录落盘都由网络线程直接完成，
+//! 界面只负责"看"。
 
 use crate::{logging, winctl};
-use eframe::egui;
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -132,7 +131,7 @@ fn json_bool(line: &str, key: &str) -> Option<bool> {
 }
 
 /// 启动读取托盘命令的线程。stdin 关闭（托盘退出或崩溃）时主程序也退出。
-pub fn spawn_reader(ctx: egui::Context) {
+pub fn spawn_reader() {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -144,7 +143,7 @@ pub fn spawn_reader(ctx: egui::Context) {
             match json_str(line, "cmd").as_deref() {
                 Some("show") => {
                     logging::info("托盘命令: show");
-                    winctl::show(&ctx);
+                    winctl::show();
                 }
                 Some("quit") => {
                     logging::info("托盘命令: quit，主程序退出");

@@ -1,7 +1,8 @@
 [package]
 name = "lan-gui"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
+build = "build.rs"
 
 # 生成的可执行文件直接叫 lanchat(.exe)，和托盘程序默认找的文件名一致
 [[bin]]
@@ -10,17 +11,25 @@ path = "src/main.rs"
 
 [dependencies]
 lan-core = { path = "../core" }
-eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
-raw-window-handle = "0.6"
+# 只用 Slint 的纯软件渲染器：不需要 OpenGL / 显卡驱动，Windows 走 GDI、Linux 走 X11/Wayland 的共享内存。
+# - 关掉默认特性：去掉 femtovg(OpenGL)、accessibility(accesskit/zbus)、system-tray 等用不到的依赖
+# - unstable-winit-030：只用来接收"拖入文件"和"窗口焦点"事件、把窗口提到前台
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "backend-winit-x11",
+    "backend-winit-wayland",
+    "renderer-software",
+    "software-renderer-systemfonts",
+    "unstable-winit-030",
+] }
+fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
+
+[build-dependencies]
+slint-build = "1.18"
 
 [features]
 # 把 gui/assets/font.ttf 编进可执行文件（真正零外部字体依赖）。
 # 需要你自己放一个中文字体文件（.ttf/.otf/.ttc 均可，改名为 font.ttf）。
 embed-font = []
-
-# Linux IME 修复：麒麟 UKUI/Wayland 上第二次 composition 不工作
-# - 让 winit::Ime::Enabled 在 Linux 上也发 egui::ImeEvent::Enabled
-# - 让 winit::Ime::Preedit(_, None) 在所有平台上发 Preedit("")
-# 上游 egui-winit 0.34.3 的 cfg 守卫过于严格
-[patch.crates-io]
-egui-winit = { path = "patches/egui-winit" }

@@ -1,0 +1,1002 @@
+// 局域网传输 - Slint 界面
+//
+// 这个文件只负责"长什么样"和"点了什么"；所有状态、网络、聊天记录都在 Rust 一侧（src/app.rs），
+// Rust 通过下面的 in 属性往界面里放数据，界面通过 callback 把点击/输入交给 Rust。
+// 控件风格由 build.rs 指定为 fluent（纯 Slint 绘制，不依赖 Qt）。
+
+import { Button, CheckBox, LineEdit, TextEdit, ScrollView, ProgressIndicator, Palette } from "std-widgets.slint";
+export struct FriendRow {
+    id: string,
+    name: string,
+    addr: string,
+    online: bool,
+    unread: int,
+    selected: bool,
+}
+
+// kind: 0 = 我发的，1 = 对方发的，2 = 系统提示
+// head: 系统提示时是"时间"，聊天气泡时是"名字  时间"
+export struct MsgRow {
+    kind: int,
+    head: string,
+    text: string,
+}
+
+export struct FoundRow {
+    text: string,
+}
+
+export struct PickRow {
+    name: string,
+    is-dir: bool,
+}
+
+global Theme {
+    out property <color> red: #c83c3c;
+    out property <color> green: #3caa5a;
+    out property <color> blue: #4682dc;
+    out property <color> weak: Palette.foreground.with-alpha(0.55);
+}
+
+// 居中的模态对话框：整个窗口压一层半透明遮罩，点遮罩不会穿透到下面
+component Modal inherits Rectangle {
+    in property <string> title;
+    in property <length> card-width: 440px;
+    background: #00000099;
+
+    TouchArea { }
+
+    card := Rectangle {
+        width: min(root.card-width, root.width - 24px);
+        height: min(inner.preferred-height, root.height - 24px);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Palette.background;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Palette.border;
+
+        inner := VerticalLayout {
+            padding: 14px;
+            spacing: 8px;
+            Text {
+                text: root.title;
+                font-size: 16px;
+                font-weight: 700;
+                color: Palette.foreground;
+            }
+            @children
+        }
+    }
+}
+
+// 左侧好友列表里的一项
+component FriendItem inherits Rectangle {
+    in property <FriendRow> friend;
+    callback activated();
+    callback clear-chat();
+    callback remove();
+
+    border-radius: 4px;
+    background: friend.selected ? Palette.selection-background.with-alpha(0.35) : (ta.has-hover ? Palette.control-background : transparent);
+
+    lay := VerticalLayout {
+        padding: 6px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle {
+                width: 12px;
+                Rectangle {
+                    width: 10px;
+                    height: 10px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
+                    background: friend.online ? Theme.green : #888888;
+                }
+            }
+            Text {
+                text: friend.unread > 0 ? friend.name + " (" + friend.unread + ")" : friend.name;
+                color: Palette.foreground;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+        HorizontalLayout {
+            padding-left: 20px;
+            Text {
+                text: friend.addr;
+                font-size: 11px;
+                color: Theme.weak;
+                overflow: elide;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        clicked => { root.activated(); }
+    }
+
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: "清空聊天记录";
+                activated => { root.clear-chat(); }
+            }
+            MenuItem {
+                title: "删除好友";
+                activated => { root.remove(); }
+            }
+        }
+    }
+}
+
+// 聊天区里的一条消息：系统提示居中灰字；我方靠右蓝底白字；对方靠左灰底。
+// 气泡最宽占聊天区的 70%。右键：复制 / 删除这条。
+component MsgItem inherits Rectangle {
+    in property <MsgRow> msg;
+    in property <length> avail;
+    callback copy-me();
+    callback delete-me();
+
+    property <bool> me: msg.kind == 0;
+
+    col := VerticalLayout {
+        spacing: 2px;
+
+        if msg.kind == 2 : HorizontalLayout {
+            alignment: center;
+            Text {
+                text: msg.head + "  " + msg.text;
+                font-size: 12px;
+                color: Theme.weak;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                max-width: max(root.avail - 24px, 120px);
+            }
+        }
+
+        if msg.kind != 2 : HorizontalLayout {
+            alignment: me ? LayoutAlignment.end : LayoutAlignment.start;
+            Text {
+                text: msg.head;
+                font-size: 11px;
+                color: Theme.weak;
+            }
+        }
+
+        if msg.kind != 2 : HorizontalLayout {
+            alignment: me ? LayoutAlignment.end : LayoutAlignment.start;
+            Rectangle {
+                border-radius: 8px;
+                background: me ? Theme.blue : Palette.control-background;
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    Text {
+                        text: msg.text;
+                        wrap: word-wrap;
+                        color: me ? #ffffff : Palette.control-foreground;
+                        max-width: max(root.avail * 0.7 - 20px, 100px);
+                    }
+                }
+
+                ContextMenuArea {
+                    Menu {
+                        MenuItem {
+                            title: "复制";
+                            activated => { root.copy-me(); }
+                        }
+                        MenuItem {
+                            title: "删除这条";
+                            activated => { root.delete-me(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "局域网传输";
+    preferred-width: 1100px;
+    preferred-height: 620px;
+    min-width: 640px;
+    min-height: 420px;
+    background: Palette.background;
+
+    // ------------------------------------------------ Rust → 界面
+    in property <string> self-line;
+    in property <string> fatal;
+    in property <[FriendRow]> friends;
+    in property <bool> has-sel;
+    in property <string> sel-name;
+    in property <string> sel-detail;
+    in property <[MsgRow]> messages;
+    in-out property <bool> follow: true;
+
+    in property <string> status;
+    in property <bool> recv-on;
+    in property <string> recv-label;
+    in property <float> recv-frac;
+    in property <string> recv-text;
+    in property <bool> send-on;
+    in property <string> send-label;
+    in property <float> send-frac;
+    in property <string> send-text-info;
+
+    in-out property <length> input-height: 150px;
+    in-out property <string> input-text;
+
+    // 好友请求
+    in property <bool> req-open;
+    in property <string> req-l1;
+    in property <string> req-l2;
+    // 收到文件
+    in property <bool> offer-open;
+    in property <string> offer-l1;
+    in property <string> offer-l2;
+    in property <string> offer-l3;
+    // 添加好友
+    in property <bool> add-open;
+    in property <bool> add-busy;
+    in property <string> add-error;
+    in property <bool> add-has-disc;
+    in property <string> add-disc-error;
+    in property <[FoundRow]> found;
+    in-out property <string> add-addr;
+    // 设置
+    in property <bool> settings-open;
+    in property <string> device-id;
+    in property <string> settings-msg;
+    in-out property <string> name-edit;
+    in-out property <string> port-edit;
+    in-out property <string> savedir-edit;
+    in-out property <bool> disc-edit;
+    in-out property <bool> dnd-edit;
+    // 拖入文件确认
+    in property <bool> drop-open;
+    in property <string> drop-target;
+    in property <[string]> drop-lines;
+    in property <string> drop-more;
+    // 清空记录确认
+    in property <bool> clear-open;
+    in property <string> clear-text;
+    // 文件选择器
+    in property <bool> picker-open;
+    in property <int> picker-purpose; // 0 = 选要发送的文件/文件夹，1 = 选接收目录
+    in property <string> picker-title;
+    in property <string> picker-error;
+    in property <[string]> picker-roots;
+    in property <[PickRow]> picker-rows;
+    in-out property <string> picker-path;
+
+    // ------------------------------------------------ 界面 → Rust
+    callback select(int);
+    callback open-add();
+    callback remove-friend(int);
+    callback ask-clear(int);
+    callback ask-clear-sel();
+    callback send-text(string);
+    callback open-picker-send();
+    callback open-settings();
+    callback req-answer(bool);
+    callback offer-answer(bool);
+    callback add-pick(int);
+    callback add-submit();
+    callback add-scan();
+    callback add-close();
+    callback settings-save();
+    callback settings-close();
+    callback settings-browse();
+    callback drop-answer(bool);
+    callback clear-answer(bool);
+    callback picker-goto(string);
+    callback picker-up();
+    callback picker-home();
+    callback picker-row(int);
+    callback picker-choose-row(int);
+    callback picker-choose-current();
+    callback picker-cancel();
+    callback delete-msg(int);
+    callback clear-status();
+
+    // 复制：借一个看不见的只读 TextInput 把文字放进系统剪贴板
+    function copy-text(t: string) {
+        clip.text = t;
+        clip.select-all();
+        clip.copy();
+    }
+
+    clip := TextInput {
+        visible: false;
+        read-only: true;
+        width: 0px;
+        height: 0px;
+    }
+
+    VerticalLayout {
+        // ---------------------------------------------- 顶栏
+        Rectangle {
+            background: Palette.alternate-background;
+            vertical-stretch: 0;
+            VerticalLayout {
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 12px;
+                    Text {
+                        text: "局域网传输";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.self-line;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "设置";
+                        clicked => { root.open-settings(); }
+                    }
+                }
+                if root.fatal != "" : HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-bottom: 6px;
+                    Text {
+                        text: root.fatal;
+                        color: Theme.red;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Palette.border;
+        }
+
+        // ---------------------------------------------- 中间：好友列表 + 聊天区
+        HorizontalLayout {
+            vertical-stretch: 1;
+
+            // —— 左：好友
+            Rectangle {
+                width: 230px;
+                background: Palette.alternate-background;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 6px;
+                    Button {
+                        text: "+ 添加好友";
+                        clicked => { root.open-add(); }
+                    }
+                    Rectangle {
+                        height: 1px;
+                        background: Palette.border;
+                    }
+                    ScrollView {
+                        VerticalLayout {
+                            spacing: 2px;
+                            alignment: start;
+                            if root.friends.length == 0 : Text {
+                                text: "还没有好友";
+                                color: Theme.weak;
+                            }
+                            for f[i] in root.friends : FriendItem {
+                                friend: f;
+                                activated => { root.select(i); }
+                                clear-chat => { root.ask-clear(i); }
+                                remove => { root.remove-friend(i); }
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                width: 1px;
+                background: Palette.border;
+            }
+
+            // —— 右：聊天
+            VerticalLayout {
+                horizontal-stretch: 1;
+
+                if !root.has-sel : Rectangle {
+                    vertical-stretch: 1;
+                    Text {
+                        text: "在左侧选择好友，或点击“+ 添加好友”";
+                        color: Theme.weak;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if root.has-sel : HorizontalLayout {
+                    padding: 8px;
+                    spacing: 10px;
+                    Text {
+                        text: root.sel-name;
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.sel-detail;
+                        color: Theme.weak;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "清空记录";
+                        clicked => { root.ask-clear-sel(); }
+                    }
+                }
+                if root.has-sel : Rectangle {
+                    height: 1px;
+                    background: Palette.border;
+                }
+
+                // 消息列表。停在底部时来新消息自动跟随；往上翻看历史时不打扰。
+                if root.has-sel : msgs := ScrollView {
+                    vertical-stretch: 1;
+
+                    changed content-height => {
+                        if (root.follow) {
+                            self.content-y = min(0px, self.height - self.content-height);
+                        }
+                    }
+                    changed content-y => {
+                        root.follow = self.content-y <= self.height - self.content-height + 2px;
+                    }
+
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+                        alignment: start;
+                        for m[i] in root.messages : MsgItem {
+                            msg: m;
+                            avail: msgs.width;
+                            copy-me => { root.copy-text(m.text); }
+                            delete-me => { root.delete-msg(i); }
+                        }
+                    }
+                }
+
+                // 输入区：顶部有一条可以拖动的分隔条，向上拖变高、向下拖变矮
+                if root.has-sel : VerticalLayout {
+                    vertical-stretch: 0;
+                    min-height: root.input-height;
+                    max-height: root.input-height;
+
+                    Rectangle {
+                        height: 8px;
+                        grip := TouchArea {
+                            mouse-cursor: MouseCursor.ns-resize;
+                            moved => {
+                                root.input-height = clamp(root.input-height - (self.mouse-y - self.pressed-y), 110px, 450px);
+                            }
+                        }
+                        Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            height: 1px;
+                            background: (grip.has-hover || grip.pressed) ? Palette.accent-background : Palette.border;
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-bottom: 4px;
+                        spacing: 10px;
+                        Button {
+                            text: "发送文件/文件夹";
+                            clicked => { root.open-picker-send(); }
+                        }
+                        Text {
+                            text: "也可以把文件或文件夹直接拖进窗口";
+                            color: Theme.weak;
+                            vertical-alignment: center;
+                        }
+                    }
+                    input := TextEdit {
+                        vertical-stretch: 1;
+                        placeholder-text: "输入文字，回车发送，Shift+回车换行";
+                        text <=> root.input-text;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return && !event.modifiers.shift) {
+                                root.send-text(root.input-text);
+                                self.focus();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    HorizontalLayout {
+                        padding: 6px;
+                        alignment: end;
+                        Button {
+                            text: "发送";
+                            clicked => {
+                                root.send-text(root.input-text);
+                                input.focus();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        //---------------------------------- 状态栏
+        Rectangle {
+            height: 1px;
+            background: Palette.border;
+        }
+        Rectangle {
+            background: Palette.alternate-background;
+            min-height: 34px;
+            vertical-stretch: 0;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 10px;
+                if root.recv-on : HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "接收（" + root.recv-label + "）";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                    ProgressIndicator {
+                        min-width: 200px;
+                        max-width: 200px;
+                        progress: root.recv-frac;
+                    }
+                    Text {
+                        text: root.recv-text;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.send-on : HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "发送（" + root.send-label + "）";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                    ProgressIndicator {
+                        min-width: 200px;
+                        max-width: 200px;
+                        progress: root.send-frac;
+                    }
+                    Text {
+                        text: root.send-text-info;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.status != "" : HorizontalLayout {
+                    spacing: 6px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.status;
+                        color: Theme.red;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "清除";
+                        clicked => { root.clear-status(); }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+    }
+
+    // ================================================== 对话框（后声明的盖在上面）
+
+    if root.req-open : Modal {
+        title: "好友请求";
+        Text {
+            text: root.req-l1;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.req-l2;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "同意";
+                primary: true;
+                clicked => { root.req-answer(true); }
+            }
+            Button {
+                text: "拒绝";
+                clicked => { root.req-answer(false); }
+            }
+        }
+    }
+
+    if root.offer-open : Modal {
+        title: "收到文件";
+        Text {
+            text: root.offer-l1;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.offer-l2;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.offer-l3;
+            color: Theme.weak;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "接收";
+                primary: true;
+                clicked => { root.offer-answer(true); }
+            }
+            Button {
+                text: "拒绝";
+                clicked => { root.offer-answer(false); }
+            }
+        }
+    }
+
+    if root.add-open : Modal {
+        title: "添加好友";
+        card-width: 500px;
+        Text {
+            text: "方式一：从局域网里发现的设备中选择";
+            color: Palette.foreground;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: "重新扫描";
+                clicked => { root.add-scan(); }
+            }
+            Text {
+                text: root.add-disc-error;
+                color: Theme.red;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+        if root.add-has-disc && root.found.length == 0 : Text {
+            text: "暂时没发现其他设备（对方需要运行本程序，并在设置里允许被发现）";
+            color: Theme.weak;
+            wrap: word-wrap;
+        }
+        ScrollView {
+            height: min(140px, root.found.length * 34px);
+            VerticalLayout {
+                alignment: start;
+                for c[i] in root.found : HorizontalLayout {
+                    height: 34px;
+                    spacing: 8px;
+                    Text {
+                        text: c.text;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "添加";
+                        enabled: !root.add-busy;
+                        clicked => { root.add-pick(i); }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Palette.border;
+        }
+        Text {
+            text: "方式二：输入对方的 IP（端口不是默认值时写成 IP:端口）";
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        LineEdit {
+            text <=> root.add-addr;
+            placeholder-text: "例如 192.168.1.5";
+            enabled: !root.add-busy;
+            accepted => { root.add-submit(); }
+        }
+        if root.add-busy : HorizontalLayout {
+            spacing: 8px;
+            ProgressIndicator {
+                min-width: 70px;
+                max-width: 70px;
+                indeterminate: true;
+            }
+            Text {
+                text: "已发送请求，等待对方点“同意”（最长 2 分钟）…";
+                color: Palette.foreground;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+        if root.add-error != "" : Text {
+            text: root.add-error;
+            color: Theme.red;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "发送请求";
+                primary: true;
+                enabled: !root.add-busy;
+                clicked => { root.add-submit(); }
+            }
+            Button {
+                text: "关闭";
+                clicked => { root.add-close(); }
+            }
+        }
+    }
+
+    if root.settings-open : Modal {
+        title: "设置";
+        card-width: 520px;
+        GridLayout {
+            spacing: 8px;
+            Row {
+                Text {
+                    text: "本机名字";
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    text <=> root.name-edit;
+                }
+            }
+            Row {
+                Text {
+                    text: "监听端口";
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    text <=> root.port-edit;
+                }
+            }
+            Row {
+                Text {
+                    text: "接收目录";
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    LineEdit {
+                        text <=> root.savedir-edit;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "浏览";
+                        clicked => { root.settings-browse(); }
+                    }
+                }
+            }
+            Row {
+                Text {
+                    text: "设备ID";
+                    color: Palette.foreground;
+                    vertical-alignment: top;
+                }
+                Text {
+                    text: root.device-id;
+                    color: Palette.foreground;
+                    wrap: char-wrap;
+                }
+            }
+        }
+        CheckBox {
+            text: "允许被局域网发现（定时广播自己的名字和端口）";
+            checked <=> root.disc-edit;
+        }
+        CheckBox {
+            text: "免打扰（不弹托盘通知，也不自动弹出窗口）";
+            checked <=> root.dnd-edit;
+        }
+        Text {
+            text: "名字和端口修改后需要重启程序才生效；设备ID是公钥，改名换 IP 都不影响好友关系";
+            color: Theme.weak;
+            wrap: word-wrap;
+        }
+        if root.settings-msg != "" : Text {
+            text: root.settings-msg;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "保存";
+                primary: true;
+                clicked => { root.settings-save(); }
+            }
+            Button {
+                text: "关闭";
+                clicked => { root.settings-close(); }
+            }
+        }
+    }
+
+    if root.drop-open : Modal {
+        title: "发送拖入的内容";
+        card-width: 520px;
+        Text {
+            text: root.drop-target != "" ? "发送给「" + root.drop-target + "」：" : "请先在左侧选择一个好友，再拖入文件";
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        for line in root.drop-lines : Text {
+            text: line;
+            color: Palette.foreground;
+            wrap: char-wrap;
+        }
+        if root.drop-more != "" : Text {
+            text: root.drop-more;
+            color: Theme.weak;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "发送";
+                primary: true;
+                enabled: root.drop-target != "";
+                clicked => { root.drop-answer(true); }
+            }
+            Button {
+                text: "取消";
+                clicked => { root.drop-answer(false); }
+            }
+        }
+    }
+
+    if root.clear-open : Modal {
+        title: "清空聊天记录";
+        Text {
+            text: root.clear-text;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        Text {
+            text: "记录会从本机删除，无法恢复（对方电脑上的记录不受影响）。";
+            color: Theme.weak;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "清空";
+                primary: true;
+                clicked => { root.clear-answer(true); }
+            }
+            Button {
+                text: "取消";
+                clicked => { root.clear-answer(false); }
+            }
+        }
+    }
+
+    if root.picker-open : Modal {
+        title: root.picker-title;
+        card-width: 600px;
+        HorizontalLayout {
+            spacing: 4px;
+            alignment: start;
+            for r in root.picker-roots : Button {
+                text: r;
+                clicked => { root.picker-goto(r); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Button {
+                text: "上一级";
+                clicked => { root.picker-up(); }
+            }
+            Button {
+                text: "主目录";
+                clicked => { root.picker-home(); }
+            }
+            LineEdit {
+                text <=> root.picker-path;
+                horizontal-stretch: 1;
+                accepted => { root.picker-goto(root.picker-path); }
+            }
+            Button {
+                text: "转到";
+                clicked => { root.picker-goto(root.picker-path); }
+            }
+        }
+        if root.picker-error != "" : Text {
+            text: root.picker-error;
+            color: Theme.red;
+            wrap: word-wrap;
+        }
+        ScrollView {
+            height: max(120px, min(300px, root.height - 230px));
+            VerticalLayout {
+                alignment: start;
+                for p[i] in root.picker-rows : Rectangle {
+                    height: 28px;
+                    background: row-ta.has-hover ? Palette.control-background : transparent;
+                    row-ta := TouchArea {
+                        clicked => { root.picker-row(i); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 8px;
+                        Text {
+                            text: p.is-dir ? p.name + "/" : p.name;
+                            font-weight: p.is-dir ? 700 : 400;
+                            color: (root.picker-purpose == 1 && !p.is-dir) ? Theme.weak : Palette.foreground;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        if p.is-dir && root.picker-purpose == 0 : Button {
+                            text: "选择";
+                            clicked => { root.picker-choose-row(i); }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Palette.border;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            if root.picker-purpose == 1 : Button {
+                text: "选择当前文件夹";
+                primary: true;
+                clicked => { root.picker-choose-current(); }
+            }
+            Button {
+                text: "取消";
+                clicked => { root.picker-cancel(); }
+            }
+        }
+    }
+}

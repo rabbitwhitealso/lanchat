@@ -4,7 +4,6 @@
 
 mod app;
 mod events;
-mod fonts;
 mod logging;
 mod net_util;
 mod picker;
@@ -12,11 +11,18 @@ mod settings;
 mod tray_ipc;
 mod winctl;
 
-use eframe::egui;
-use std::sync::atomic::Ordering;
+// 生成 MainWindow、FriendRow、MsgRow … （来自 ui/main.slint，由 build.rs 编译）
+slint::include_modules!();
 
-/// 主窗口标题。winctl 在 Windows 上靠它找到自己的窗口，两处必须一致。
-pub const WINDOW_TITLE: &str = "局域网传输";
+use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
+use slint::ComponentHandle;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// 托盘模式下启动后是否自动隐藏主窗口。
+/// 旧版（egui）为了调试托盘把这一行注释掉了，所以这里保持"不隐藏"；
+/// 调好托盘以后改成 true 即恢复 README 里描述的行为（`--show` 参数仍可强制显示）。
+const HIDE_AT_START_IN_TRAY: bool = false;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -32,12 +38,10 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--recv-dir")
         .map(|w| std::path::PathBuf::from(&w[1]));
+    // 旧版的 --soft-gl 在 Slint 版里没有意义（本来就是纯软件渲染），收到也直接忽略。
 
     logging::init(tray_mode);
 
-     // 最早启用软件 OpenGL，必须早于任何可能加载 opengl32.dll 的代码
-    #[cfg_attr(not(windows), allow(unused_variables))]
-    let soft_gl = args.iter().any(|a| a == "--soft-gl");
     if auto_receive {
         logging::info(format!("已启用自动接收，保存目录={:?}", recv_dir));
     }
@@ -59,92 +63,85 @@ fn main() {
     tray_ipc::ENABLED.store(tray_mode, Ordering::Relaxed);
     events::configure_auto_receive(auto_receive, recv_dir);
 
-    //统一使用glow
-    let renderer = eframe::Renderer::Glow;
-    let renderer_name = format!("{:?}", renderer);
-    logging::info(format!("GUI 渲染器={renderer_name}"));
+    logging::info("GUI 框架=Slint，渲染器=软件渲染（不依赖 OpenGL）；创建窗口…");
 
-    let options = eframe::NativeOptions {
-        renderer,
-        viewport: egui::ViewportBuilder::default()
-            .with_title(WINDOW_TITLE)
-            .with_inner_size([920.0, 620.0])
-            .with_min_inner_size([640.0, 420.0]),
-        // Linux（麒麟软件渲染）上请求垂直同步会触发 GLXBadContextTag，所以关闭；Windows 保持开启
-        vsync: !cfg!(target_os = "linux"),
-        ..Default::default()
-    };
-
-    logging::info(format!(
-        "创建窗口（eframe::run_native，renderer={renderer_name}）…"
-    ));
-
-    let result = eframe::run_native(
-        WINDOW_TITLE,
-        options,
-        Box::new(move |cc| {
-            logging::info("窗口和图形渲染上下文创建成功，初始化界面…");
-            Ok(Box::new(app::App::new(cc, tray_mode, show_at_start)))
-        }),
-    );
-
-    match result {
-        Ok(()) => logging::info("窗口已关闭，程序正常退出"),
+    let ui = match MainWindow::new() {
+        Ok(ui) => ui,
         Err(e) => {
-            let msg = format!(
-                "GUI/图形渲染初始化失败（renderer={renderer_name}）：{e}"
-            );
-            logging::error(&msg);
-            #[cfg(windows)]
-            if !soft_gl {
-                match relaunch_with_soft_gl() {
-                    Ok(code) => std::process::exit(code),
-                    Err(e) => logging::error(format!("软件 OpenGL 重启失败：{e}")),
+            fail(tray_mode, &format!("窗口创建失败：{e}"));
+            return;
+        }
+    };
+    winctl::register(ui.as_weak());
+
+    // 关闭按钮：托盘模式 = 只隐藏（程序继续在后台收消息，退出走托盘菜单）；否则退出
+    ui.window().on_close_requested(move || {
+        if tray_mode {
+            tray_ipc::FOCUSED.store(false, Ordering::Relaxed);
+            logging::info("点击关闭 → 隐藏到托盘（程序继续在后台运行）");
+        } else {
+            logging::info("点击关闭 → 退出");
+            let _ = slint::quit_event_loop();
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
+
+    // 拖入文件 + 窗口焦点（Slint 本身不提供这两个事件，从 winit 拿）
+    ui.window().on_winit_window_event(|_win, ev| {
+        match ev {
+            winit::event::WindowEvent::DroppedFile(p) => app::handle_dropped_file(p.clone()),
+            winit::event::WindowEvent::Focused(focused) => {
+                // 窗口回到前台：托盘角标的未读数清零
+                tray_ipc::FOCUSED.store(*focused, Ordering::Relaxed);
+                if *focused && tray_ipc::UNREAD.swap(0, Ordering::Relaxed) > 0 {
+                    tray_ipc::publish_unread();
                 }
             }
-            if !tray_mode {
-                logging::message_box(
-                    "局域网传输 - 无法启动",
-                    &format!(
-                        "{msg}\n\n常见原因：显卡驱动缺失、过旧或异常；远程桌面/虚拟机图形环境不完整；\
-                        系统图形组件异常。\n\n建议优先安装或更新显卡驱动。\n\n详细日志：{}",
-                        logging::log_hint()
-                    ),
-                );
-            }
-
-            std::process::exit(1);
+            _ => {}
         }
+        EventResult::Propagate
+    });
+
+    let _app = app::App::start(&ui, tray_mode);
+
+    // 每秒一次：好友名字/地址变化、发现列表等不走事件的更新
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), app::tick);
+
+    let hide_now = tray_mode
+        && HIDE_AT_START_IN_TRAY
+        && !show_at_start
+        && !tray_ipc::WANT_SHOW.load(Ordering::Relaxed);
+    if hide_now {
+        logging::info("托盘模式：启动后自动隐藏主窗口（点托盘图标显示）");
+    } else if let Err(e) = ui.show() {
+        fail(tray_mode, &format!("显示窗口失败：{e}"));
+        return;
     }
+
+    let _ = slint::invoke_from_event_loop(|| logging::info("界面事件循环已启动"));
+
+    // 用 until_quit：主窗口隐藏后事件循环仍然运行，托盘命令/网络事件才能把窗口再叫出来
+    if let Err(e) = slint::run_event_loop_until_quit() {
+        fail(tray_mode, &format!("界面事件循环异常退出：{e}"));
+        return;
+    }
+    drop(timer);
+    logging::info("窗口已关闭，程序正常退出");
 }
 
-#[cfg(windows)]
-fn relaunch_with_soft_gl() -> Result<i32, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe.parent().ok_or("找不到程序目录")?;
-    let src = dir.join("opengl32sw.dll");
-    let dst = dir.join("opengl32.dll");
-    if !src.exists() {
-        return Err(format!("没有找到 {}", src.display()));
+fn fail(tray_mode: bool, what: &str) {
+    let msg = format!("GUI 初始化失败：{what}");
+    logging::error(&msg);
+    if !tray_mode {
+        logging::message_box(
+            "局域网传输 - 无法启动",
+            &format!(
+                "{msg}\n\n常见原因：没有可用的图形会话（DISPLAY / WAYLAND_DISPLAY 未设置）、\
+                 远程桌面/虚拟机图形环境不完整。\n\n详细日志：{}",
+                logging::log_hint()
+            ),
+        );
     }
-    if dst.exists() {
-        // 已经有 opengl32.dll 了还是失败，说明问题不在这里，不要循环重启，也不要动别人放的文件
-        return Err(format!("{} 已存在，但图形初始化仍然失败", dst.display()));
-    }
-    std::fs::copy(&src, &dst)
-        .map_err(|e| format!("复制 opengl32.dll 失败（目录可能没有写权限）：{e}"))?;
-    logging::info(format!("已生成 {}，用软件 OpenGL 重新启动", dst.display()));
-
-    let mut a: Vec<String> = std::env::args().skip(1).collect();
-    a.push("--soft-gl".into());
-    let status = std::process::Command::new(&exe).args(a).status();
-
-    // 子进程退出后清理，下次启动仍然先试硬件渲染
-    for _ in 0..10 {
-        match std::fs::remove_file(&dst) {
-            Ok(()) => break,
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
-        }
-    }
-    status.map(|s| s.code().unwrap_or(1)).map_err(|e| e.to_string())
+    std::process::exit(1);
 }

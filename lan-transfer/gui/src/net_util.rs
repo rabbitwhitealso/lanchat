@@ -1,8 +1,7 @@
 //! 网络小工具：本机 IP 列表、好友在线探测
 
-use crate::events::Event;
+use crate::events::{Event, Waker};
 use crate::tray_ipc;
-use eframe::egui;
 use lan_core::wire::DeviceId;
 use lan_core::{netinfo, Friend, Node};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -47,7 +46,7 @@ fn probe(f: &Friend) -> bool {
 
 /// 后台线程：每 10 秒并行探测所有好友的端口是否可连，并把在线人数同步给托盘
 /// （只是 TCP 连一下就断开，对方程序会静默忽略，不会弹任何提示）
-pub fn spawn_presence(node: Arc<Node>, tx: Sender<Event>, ctx: egui::Context) {
+pub fn spawn_presence(node: Arc<Node>, tx: Sender<Event>, wake: Waker) {
     thread::spawn(move || loop {
         let friends = node.friends.list();
         let result: Vec<(DeviceId, bool)> = thread::scope(|s| {
@@ -62,7 +61,7 @@ pub fn spawn_presence(node: Arc<Node>, tx: Sender<Event>, ctx: egui::Context) {
         if tx.send(Event::Presence(result)).is_err() {
             break; // 界面已关闭
         }
-        ctx.request_repaint();
+        wake();
         thread::sleep(Duration::from_secs(10));
     });
 }

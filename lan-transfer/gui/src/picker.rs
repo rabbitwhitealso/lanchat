@@ -1,9 +1,8 @@
-//! 内置的文件/文件夹选择器。
+//! 内置的文件/文件夹选择器（逻辑部分）。
 //! 不用系统原生对话框（rfd 在 Linux 上依赖 GTK 或 portal，违背"零依赖"），
-//! 完全用 egui + std::fs 实现。
+//! 完全用 std::fs 实现；界面在 ui/main.slint 里，数据由 app.rs 搬运。
 
 use crate::settings::home_dir;
-use eframe::egui::{self, Color32};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -14,24 +13,17 @@ pub enum PickPurpose {
     SaveDir,
 }
 
-pub enum PickOutcome {
-    None,
-    Cancel,
-    Chosen(PathBuf),
-}
-
-struct Row {
-    name: String,
-    is_dir: bool,
+pub struct Row {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 pub struct Picker {
     pub purpose: PickPurpose,
     cwd: PathBuf,
-    rows: Vec<Row>,
-    path_text: String,
-    error: String,
-    roots: Vec<String>,
+    pub rows: Vec<Row>,
+    pub error: String,
+    pub roots: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -80,7 +72,6 @@ impl Picker {
             purpose,
             cwd: PathBuf::new(),
             rows: Vec::new(),
-            path_text: String::new(),
             error: String::new(),
             roots: roots(),
         };
@@ -89,16 +80,16 @@ impl Picker {
         p
     }
 
-    /// 当前所在目录（用来记住上次位置）
+    /// 当前所在目录（用来记住上次位置，也是地址栏要显示的内容）
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
-    fn go(&mut self, dir: PathBuf) {
+    /// 进入目录。失败时留在原地并记下错误
+    pub fn go(&mut self, dir: PathBuf) {
         match read_rows(&dir) {
             Ok(rows) => {
                 self.rows = rows;
-                self.path_text = dir.display().to_string();
                 self.cwd = dir;
                 self.error.clear();
             }
@@ -108,93 +99,18 @@ impl Picker {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) -> PickOutcome {
-        let mut outcome = PickOutcome::None;
-        let mut goto: Option<PathBuf> = None;
-        let title = match self.purpose {
-            PickPurpose::SendPath => "选择要发送的文件或文件夹",
-            PickPurpose::SaveDir => "选择接收目录",
-        };
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .default_size([540.0, 440.0])
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                if !self.roots.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        for r in &self.roots {
-                            if ui.small_button(r.as_str()).clicked() {
-                                goto = Some(PathBuf::from(r));
-                            }
-                        }
-                    });
-                }
-
-                ui.horizontal(|ui| {
-                    if ui.button("上一级").clicked() {
-                        if let Some(p) = self.cwd.parent() {
-                            goto = Some(p.to_path_buf());
-                        }
-                    }
-                    if ui.button("主目录").clicked() {
-                        goto = Some(home_dir());
-                    }
-                    let w = (ui.available_width() - 60.0).max(80.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.path_text).desired_width(w));
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let click = ui.button("转到").clicked();
-                    if enter || click {
-                        goto = Some(PathBuf::from(self.path_text.trim()));
-                    }
-                });
-
-                ui.separator();
-                if !self.error.is_empty() {
-                    ui.colored_label(Color32::from_rgb(200, 60, 60), self.error.as_str());
-                }
-
-                egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for row in &self.rows {
-                            ui.horizontal(|ui| {
-                                if row.is_dir {
-                                    let label = egui::RichText::new(format!("{}/", row.name)).strong();
-                                    if ui.selectable_label(false, label).clicked() {
-                                        goto = Some(self.cwd.join(&row.name));
-                                    }
-                                    if self.purpose == PickPurpose::SendPath
-                                        && ui.small_button("选择").clicked()
-                                    {
-                                        outcome = PickOutcome::Chosen(self.cwd.join(&row.name));
-                                    }
-                                } else if self.purpose == PickPurpose::SendPath {
-                                    if ui.selectable_label(false, row.name.as_str()).clicked() {
-                                        outcome = PickOutcome::Chosen(self.cwd.join(&row.name));
-                                    }
-                                } else {
-                                    ui.weak(row.name.as_str());
-                                }
-                            });
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if self.purpose == PickPurpose::SaveDir && ui.button("选择当前文件夹").clicked() {
-                        outcome = PickOutcome::Chosen(self.cwd.clone());
-                    }
-                    if ui.button("取消").clicked() {
-                        outcome = PickOutcome::Cancel;
-                    }
-                });
-            });
-
-        if let Some(p) = goto {
+    pub fn up(&mut self) {
+        if let Some(p) = self.cwd.parent() {
+            let p = p.to_path_buf();
             self.go(p);
         }
-        outcome
+    }
+
+    pub fn home(&mut self) {
+        self.go(home_dir());
+    }
+
+    pub fn path_of(&self, idx: usize) -> Option<PathBuf> {
+        self.rows.get(idx).map(|r| self.cwd.join(&r.name))
     }
 }
